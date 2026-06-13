@@ -2,36 +2,16 @@
 # =============================================================================
 # AppRun — Wallpaper Motor AppImage Entrypoint
 # =============================================================================
-# This script is the entrypoint for the AppImage. It sets up the environment
-# so that PyQt6 finds the bundled Qt plugins, Python finds its packages,
-# and yt-dlp (bundled) is available to mpv via PATH.
-# =============================================================================
 
-# Resolve the AppImage root (APPDIR is set by the AppImage runtime, but we
-# also set it ourselves here so the Python app can read it for icon paths).
+# Resolve the AppImage root directory
 HERE="$(dirname "$(readlink -f "${0}")")"
 export APPDIR="${HERE}"
 
-# --- Python environment ---
-# Point Python to the bundled standard library and site-packages
-export PYTHONHOME="${HERE}/usr"
-export PYTHONPATH="${HERE}/usr/lib/python3/site-packages:${HERE}/usr/lib/python3:${PYTHONPATH}"
-
-# --- Qt platform ---
-# Force X11/XCB backend — required for XFCE/X11 environments and xwinwrap
+# Force X11/XCB backend — required for XFCE/X11 desktop overlay compatibility
 export QT_QPA_PLATFORM="${QT_QPA_PLATFORM:-xcb}"
 
-# Ensure Qt finds its bundled platform plugins inside the AppDir
-export QT_PLUGIN_PATH="${HERE}/usr/lib/python3/site-packages/PyQt6/Qt6/plugins:${HERE}/usr/plugins:${QT_PLUGIN_PATH}"
-export QT_QPA_PLATFORMTHEME=""
-
-# --- yt-dlp on PATH ---
-# Bundled yt-dlp binary (installed by pip) must be on PATH so mpv can call it
+# Ensure xwinwrap and other bundled binaries are in PATH
 export PATH="${HERE}/usr/bin:${PATH}"
 
-# --- Library path ---
-# Ensure bundled shared libs are available (e.g. libsip, libQt6Core, etc.)
-export LD_LIBRARY_PATH="${HERE}/usr/lib:${HERE}/usr/lib/python3/site-packages/PyQt6/Qt6/lib:${LD_LIBRARY_PATH}"
-
-# --- Launch the application ---
-exec "${HERE}/usr/bin/python3" "${HERE}/usr/src/wallpaper_manager.py" "$@"
+# Launch the application using the python-appimage bundled wrapper script
+exec "${HERE}/usr/bin/python3.11" "${HERE}/usr/src/wallpaper_manager.py" "$@"

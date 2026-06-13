@@ -6,28 +6,23 @@ on:
   release:
     types: [created]
 
-env:
-  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
-
 jobs:
   build:
     name: Build Wallpaper Motor AppImage
     runs-on: ubuntu-22.04
 
-    # Make the built-in GITHUB_TOKEN available to all steps
     permissions:
       contents: write
 
     steps:
       # -----------------------------------------------------------------------
-      # 1. Checkout
+      # 1. Checkout (using v6 to avoid deprecated Node.js versions)
       # -----------------------------------------------------------------------
       - name: Checkout repository
-        uses: actions/checkout@v4
+        uses: actions/checkout@v6
 
       # -----------------------------------------------------------------------
       # 2. System build dependencies
-      #    libx11-dev + libxext-dev are required to compile xwinwrap
       # -----------------------------------------------------------------------
       - name: Install system dependencies
         run: |
@@ -58,9 +53,7 @@ jobs:
           echo "xwinwrap built OK"
 
       # -----------------------------------------------------------------------
-      # 4. Download the latest Python 3.11 AppImage
-      #    FIX: Use Authorization header with GITHUB_TOKEN to avoid the
-      #    60-req/hr unauthenticated rate limit that causes empty JSON → exit 1
+      # 4. Fetch latest Python 3.11 AppImage
       # -----------------------------------------------------------------------
       - name: Fetch latest Python 3.11 AppImage
         env:
@@ -72,9 +65,9 @@ jobs:
             "https://api.github.com/repos/niess/python-appimage/releases/tags/python3.11" \
             -o python311_release.json
 
-          # Dump first 200 chars for debugging if parse fails
           echo "=== API response preview ==="
           head -c 200 python311_release.json || true
+          echo ""
 
           PYTHON_URL=$(python3 - << 'PYEOF'
           import json, sys
@@ -85,7 +78,7 @@ jobs:
               if "manylinux2014_x86_64" in a["name"] and a["name"].endswith(".AppImage")
           ]
           if not hits:
-              sys.exit("ERROR: no manylinux2014_x86_64 AppImage found. assets=" + str([a["name"] for a in assets]))
+              sys.exit("ERROR: no manylinux2014_x86_64 AppImage found.")
           print(hits[0])
           PYEOF
           )
@@ -95,32 +88,27 @@ jobs:
           chmod +x python3-base.AppImage
 
       # -----------------------------------------------------------------------
-      # 5. Extract Python AppImage → AppDir, strip Python's own metadata
-      #    (multiple .desktop files at AppDir root was the original exit-code-8)
+      # 5. Extract Python AppImage and clean up metadata
       # -----------------------------------------------------------------------
       - name: Extract Python AppImage and clean metadata
         run: |
           ./python3-base.AppImage --appimage-extract
           mv squashfs-root AppDir
 
-          # Remove Python's own desktop entry, AppRun, root icons
+          # Strip Python's own desktop entry, AppRun, root icons to avoid conflicts
           rm -f AppDir/*.desktop AppDir/AppRun AppDir/.DirIcon AppDir/*.png AppDir/*.svg
 
           echo "=== AppDir root after cleanup ==="
           ls -la AppDir/
-          echo "=== Python binary ==="
-          ls AppDir/usr/bin/python3*
 
       # -----------------------------------------------------------------------
-      # 6. Install Python dependencies into AppDir
+      # 6. Install Python dependencies directly into the bundle's site-packages
       # -----------------------------------------------------------------------
       - name: Install Python dependencies into AppDir
         run: |
           PYTHON="${PWD}/AppDir/usr/bin/python3.11"
           "${PYTHON}" -m pip install --upgrade pip --quiet
           "${PYTHON}" -m pip install \
-            --prefix="${PWD}/AppDir/usr" \
-            --no-warn-script-location \
             "PyQt6>=6.4.0" \
             "yt-dlp>=2024.1.1"
           echo "=== Installed packages ==="
@@ -159,10 +147,7 @@ jobs:
           cp wallpaper-motor.desktop AppDir/usr/share/applications/
           desktop-file-validate AppDir/wallpaper-motor.desktop || true
 
-          # FIX: Write launcher via printf — avoids heredoc indentation issues
-          # that occur when 'cat <<EOF ... EOF' terminators get leading spaces
-          # from YAML block scalar dedenting, causing the shell to never close
-          # the heredoc and exit 1.
+          # Create a wrapper executable script at usr/bin/wallpaper-motor
           printf '#!/bin/bash\nexec "${APPDIR}/usr/bin/python3.11" "${APPDIR}/usr/src/wallpaper_manager.py" "$@"\n' \
             > AppDir/usr/bin/wallpaper-motor
           chmod +x AppDir/usr/bin/wallpaper-motor
@@ -191,8 +176,6 @@ jobs:
 
       # -----------------------------------------------------------------------
       # 11. Package AppImage using mksquashfs + type2 runtime concatenation
-      #     FIX: Removed -root-owned flag (requires root; GitHub runners don't
-      #     have it). Using -comp xz for maximum distro compatibility vs zstd.
       # -----------------------------------------------------------------------
       - name: Download AppImage runtime
         run: |
@@ -203,19 +186,13 @@ jobs:
 
       - name: Package AppImage
         run: |
-          # Build squashfs (no -root-owned: requires root; -comp xz: widest compat)
+          # Build squashfs
           mksquashfs AppDir wallpaper-motor.squashfs \
             -noappend \
             -comp xz \
             -no-progress
 
           echo "squashfs size: $(ls -lh wallpaper-motor.squashfs)"
-
-          # The AppImage offset must be block-aligned to the runtime boundary.
-          # Standard type2 runtime is exactly 188416 bytes (184 KiB).
-          # Pad with zeros to block boundary, then append squashfs.
-          RUNTIME_SIZE=$(wc -c < runtime-x86_64)
-          echo "Runtime size: ${RUNTIME_SIZE} bytes"
 
           cat runtime-x86_64 wallpaper-motor.squashfs > Wallpaper-Motor-x86_64.AppImage
           chmod +x Wallpaper-Motor-x86_64.AppImage
@@ -224,21 +201,21 @@ jobs:
           ls -lh Wallpaper-Motor-x86_64.AppImage
 
       # -----------------------------------------------------------------------
-      # 12. Upload artifact
+      # 12. Upload artifact (using v7 to avoid deprecated Node.js versions)
       # -----------------------------------------------------------------------
       - name: Upload AppImage artifact
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: Wallpaper-Motor-x86_64-AppImage
           path: Wallpaper-Motor-x86_64.AppImage
           retention-days: 30
 
       # -----------------------------------------------------------------------
-      # 13. Attach to GitHub Release (release events only)
+      # 13. Attach to GitHub Release (using v3 to avoid deprecated Node.js versions)
       # -----------------------------------------------------------------------
       - name: Attach to GitHub Release
         if: github.event_name == 'release'
-        uses: softprops/action-gh-release@v2
+        uses: softprops/action-gh-release@v3
         with:
           files: Wallpaper-Motor-x86_64.AppImage
         env:
