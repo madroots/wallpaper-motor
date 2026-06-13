@@ -368,106 +368,454 @@ class ProcessManager:
 
 
 # ==============================================================================
-# Startup Runtime Dependency Checker
+# Startup Onboarding — Distro-Aware Dependency Checker
 # ==============================================================================
 
-REQUIRED_RUNTIME_DEPS = [
+import shutil
+
+# Tools that must be on the HOST system.
+# xwinwrap is intentionally absent here: when running from the AppImage it is
+# bundled in $APPDIR/usr/bin (already on PATH via AppRun). When running from
+# source it will still be found by shutil.which if the user has it installed.
+HOST_DEPS = [
     {
         "binary": "mpv",
-        "description": "Media player backend (renders the video stream)",
-        "install_hint": "sudo zypper in mpv  (openSUSE)  |  sudo apt install mpv  (Debian/Ubuntu)",
+        "label": "mpv",
+        "description": "Video player engine that renders the stream onto the desktop.",
+        "pkg": "mpv",
     },
     {
-        "binary": "xwinwrap",
-        "description": "X11 desktop overlay window wrapper",
-        "install_hint": "Build from source: https://github.com/ujjwal96/xwinwrap\n"
-                        "openSUSE: check OBS community repo or build manually.",
+        "binary": "ffmpeg",
+        "label": "ffmpeg",
+        "description": "Media processing library used by mpv for decoding and muxing.",
+        "pkg": "ffmpeg",
     },
 ]
 
+# When running from source (not AppImage) xwinwrap must also be present.
+_XWINWRAP_DEP = {
+    "binary": "xwinwrap",
+    "label": "xwinwrap",
+    "description": "X11 window overlay wrapper — places the video behind all desktop icons.",
+    "pkg": "xwinwrap",
+}
 
-def _is_in_path(binary: str) -> bool:
-    """Returns True if *binary* can be found in the system PATH."""
-    import shutil
+
+# ---------------------------------------------------------------------------
+# Distro detection
+# ---------------------------------------------------------------------------
+
+# Per-distro install commands: (distro_id_fragment, friendly_name, install_template)
+# Checked against /etc/os-release ID and ID_LIKE fields.
+_DISTRO_TABLE = [
+    ("opensuse",   "openSUSE",         "sudo zypper install {pkg}"),
+    ("suse",       "SUSE",              "sudo zypper install {pkg}"),
+    ("ubuntu",     "Ubuntu",            "sudo apt install {pkg}"),
+    ("debian",     "Debian",            "sudo apt install {pkg}"),
+    ("linuxmint",  "Linux Mint",        "sudo apt install {pkg}"),
+    ("pop",        "Pop!_OS",           "sudo apt install {pkg}"),
+    ("elementary", "elementary OS",     "sudo apt install {pkg}"),
+    ("kali",       "Kali Linux",        "sudo apt install {pkg}"),
+    ("fedora",     "Fedora",            "sudo dnf install {pkg}"),
+    ("centos",     "CentOS",            "sudo dnf install {pkg}"),
+    ("rhel",       "Red Hat",           "sudo dnf install {pkg}"),
+    ("almalinux",  "AlmaLinux",         "sudo dnf install {pkg}"),
+    ("rocky",      "Rocky Linux",       "sudo dnf install {pkg}"),
+    ("arch",       "Arch Linux",        "sudo pacman -S {pkg}"),
+    ("manjaro",    "Manjaro",           "sudo pacman -S {pkg}"),
+    ("endeavouros","EndeavourOS",       "sudo pacman -S {pkg}"),
+    ("garuda",     "Garuda Linux",      "sudo pacman -S {pkg}"),
+    ("void",       "Void Linux",        "sudo xbps-install {pkg}"),
+    ("alpine",     "Alpine Linux",      "sudo apk add {pkg}"),
+    ("gentoo",     "Gentoo",            "sudo emerge {pkg}"),
+    ("nixos",      "NixOS",             "nix-env -iA nixpkgs.{pkg}"),
+    ("solus",      "Solus",             "sudo eopkg install {pkg}"),
+    ("mageia",     "Mageia",            "sudo urpmi {pkg}"),
+    ("slackware",  "Slackware",         "sudo slackpkg install {pkg}"),
+]
+
+
+def _read_os_release() -> dict:
+    """Parse /etc/os-release into a dict."""
+    info = {}
+    for path in ("/etc/os-release", "/usr/lib/os-release"):
+        try:
+            with open(path) as f:
+                for line in f:
+                    line = line.strip()
+                    if "=" in line and not line.startswith("#"):
+                        k, _, v = line.partition("=")
+                        info[k.strip()] = v.strip().strip('"')
+            break
+        except OSError:
+            continue
+    return info
+
+
+def _detect_distro() -> tuple[str, str]:
+    """
+    Returns (friendly_name, install_template) for the running distribution.
+    Falls back to probing the available package manager binary.
+    """
+    os_info = _read_os_release()
+    distro_id   = os_info.get("ID", "").lower()
+    id_like     = os_info.get("ID_LIKE", "").lower()
+    pretty_name = os_info.get("PRETTY_NAME", os_info.get("NAME", "Linux"))
+
+    search_ids = [distro_id] + id_like.split()
+
+    for search_id in search_ids:
+        for fragment, name, template in _DISTRO_TABLE:
+            if fragment in search_id:
+                return name, template
+
+    # Fallback: probe which package manager is available
+    for binary, template in [
+        ("zypper",       "sudo zypper install {pkg}"),
+        ("apt",          "sudo apt install {pkg}"),
+        ("apt-get",      "sudo apt-get install {pkg}"),
+        ("dnf",          "sudo dnf install {pkg}"),
+        ("yum",          "sudo yum install {pkg}"),
+        ("pacman",       "sudo pacman -S {pkg}"),
+        ("xbps-install", "sudo xbps-install {pkg}"),
+        ("apk",          "sudo apk add {pkg}"),
+        ("emerge",       "sudo emerge {pkg}"),
+        ("eopkg",        "sudo eopkg install {pkg}"),
+    ]:
+        if shutil.which(binary):
+            return pretty_name, template
+
+    return pretty_name, "# Install {pkg} with your system package manager"
+
+
+def _is_present(binary: str) -> bool:
     return shutil.which(binary) is not None
 
 
-def check_runtime_dependencies(parent_widget=None) -> list[str]:
+def get_missing_deps() -> list[dict]:
+    """Returns a list of dep dicts that are currently missing from PATH."""
+    deps = list(HOST_DEPS)
+    # Add xwinwrap check only when NOT running from an AppImage
+    if not os.environ.get("APPDIR"):
+        deps.append(_XWINWRAP_DEP)
+    return [d for d in deps if not _is_present(d["binary"])]
+
+
+# ---------------------------------------------------------------------------
+# OnboardingDialog
+# ---------------------------------------------------------------------------
+
+class OnboardingDialog(QDialog):
     """
-    Checks whether each required external tool is present in $PATH.
-
-    Returns a list of missing binary names. An empty list means all
-    dependencies are satisfied.
-
-    When *parent_widget* is provided and dependencies are missing, displays
-    a styled QMessageBox warning dialog so the user knows exactly what to
-    install before attempting to deploy a wallpaper.
+    Shown at startup when host dependencies (mpv, ffmpeg) are missing.
+    Detects the user's Linux distribution and shows the exact install command
+    for their package manager. Features copy-to-clipboard and re-check.
     """
-    missing = [
-        dep for dep in REQUIRED_RUNTIME_DEPS
-        if not _is_in_path(dep["binary"])
-    ]
 
-    if missing and parent_widget is not None:
-        _show_dependency_warning(missing, parent_widget)
+    def __init__(self, missing_deps: list[dict], parent=None):
+        super().__init__(parent)
+        self.missing_deps = missing_deps
+        self.distro_name, self.install_template = _detect_distro()
+        self._dep_rows: dict[str, dict] = {}  # binary -> {row widgets}
+        self.setWindowTitle("Setup Required — Missing Dependencies")
+        self.setMinimumWidth(580)
+        self.setWindowIcon(create_app_icon())
+        self.setStyleSheet(self._qss())
+        self._build_ui()
 
-    return [dep["binary"] for dep in missing]
+    # ------------------------------------------------------------------ UI --
+    def _build_ui(self):
+        root = QVBoxLayout(self)
+        root.setContentsMargins(0, 0, 0, 0)
+        root.setSpacing(0)
 
+        # ── Header banner ────────────────────────────────────────────────────
+        header = QFrame()
+        header.setObjectName("ob-header")
+        header.setFixedHeight(90)
+        h_layout = QHBoxLayout(header)
+        h_layout.setContentsMargins(24, 0, 24, 0)
+        h_layout.setSpacing(16)
 
-def _show_dependency_warning(missing_deps: list[dict], parent=None) -> None:
-    """Displays a rich warning dialog listing missing host dependencies."""
-    lines = [
-        "<p style='color:#e2e2e9; font-size:13px;'>"
-        "<b>Wallpaper Motor</b> requires the following tools to be installed "
-        "on your host system. They were <b style='color:#ef233c;'>not found</b> "
-        "in your PATH:</p>",
-        "<ul style='color:#e2e2e9; font-size:12px;'>",
-    ]
+        icon_lbl = QLabel()
+        icon_lbl.setPixmap(create_app_icon().pixmap(QSize(52, 52)))
+        h_layout.addWidget(icon_lbl)
 
-    for dep in missing_deps:
-        lines.append(
-            f"<li style='margin-bottom:8px;'>"
-            f"<b style='color:#00b4d8;'>{dep['binary']}</b> — "
-            f"{dep['description']}<br/>"
-            f"<span style='color:#7a7a85; font-size:11px;'>"
-            f"Install: {dep['install_hint'].replace(chr(10), '<br/>')}"
-            f"</span></li>"
-        )
+        text_col = QVBoxLayout()
+        text_col.setSpacing(2)
+        title_lbl = QLabel("Wallpaper Motor")
+        title_lbl.setObjectName("ob-title")
+        sub_lbl = QLabel("A few host tools need to be installed before you can deploy wallpapers.")
+        sub_lbl.setObjectName("ob-sub")
+        sub_lbl.setWordWrap(True)
+        text_col.addWidget(title_lbl)
+        text_col.addWidget(sub_lbl)
+        h_layout.addLayout(text_col)
+        root.addWidget(header)
 
-    lines.append("</ul>")
-    lines.append(
-        "<p style='color:#ffb703; font-size:12px;'>"
-        "⚠ You can still manage your stream library, but <b>Apply Wallpaper</b> "
-        "will be unavailable until these tools are installed.</p>"
-    )
+        # ── Distro badge ─────────────────────────────────────────────────────
+        distro_row = QHBoxLayout()
+        distro_row.setContentsMargins(24, 12, 24, 4)
+        distro_lbl = QLabel(f"Detected distribution:")
+        distro_lbl.setObjectName("ob-label")
+        distro_val = QLabel(self.distro_name)
+        distro_val.setObjectName("ob-distro-val")
+        distro_row.addWidget(distro_lbl)
+        distro_row.addWidget(distro_val)
+        distro_row.addStretch()
+        root.addLayout(distro_row)
 
-    msg = QMessageBox(parent)
-    msg.setWindowTitle("Missing Runtime Dependencies")
-    msg.setIcon(QMessageBox.Icon.Warning)
-    msg.setTextFormat(Qt.TextFormat.RichText)
-    msg.setText("".join(lines))
-    msg.setStyleSheet("""
-        QMessageBox {
+        # ── Dependency cards ─────────────────────────────────────────────────
+        cards_widget = QWidget()
+        cards_widget.setObjectName("ob-cards")
+        cards_layout = QVBoxLayout(cards_widget)
+        cards_layout.setContentsMargins(20, 8, 20, 8)
+        cards_layout.setSpacing(10)
+
+        for dep in self.missing_deps:
+            card, row_data = self._make_dep_card(dep)
+            cards_layout.addWidget(card)
+            self._dep_rows[dep["binary"]] = row_data
+
+        root.addWidget(cards_widget)
+
+        # ── Note about xwinwrap (AppImage only) ──────────────────────────────
+        if not os.environ.get("APPDIR"):
+            note = QLabel(
+                "ℹ  <b>xwinwrap</b> must also be installed when running from source — "
+                "it is bundled automatically inside the AppImage."
+            )
+            note.setObjectName("ob-note")
+            note.setWordWrap(True)
+            note.setTextFormat(Qt.TextFormat.RichText)
+            note.setContentsMargins(24, 0, 24, 8)
+            root.addWidget(note)
+
+        # ── Buttons ───────────────────────────────────────────────────────────
+        btn_row = QHBoxLayout()
+        btn_row.setContentsMargins(20, 8, 20, 20)
+        btn_row.setSpacing(10)
+
+        self.btn_recheck = QPushButton("↻  Re-check Dependencies")
+        self.btn_recheck.setObjectName("ob-btn-recheck")
+        self.btn_recheck.clicked.connect(self._recheck)
+
+        btn_continue = QPushButton("Continue Anyway")
+        btn_continue.setObjectName("ob-btn-continue")
+        btn_continue.clicked.connect(self.accept)
+
+        btn_row.addWidget(self.btn_recheck)
+        btn_row.addStretch()
+        btn_row.addWidget(btn_continue)
+        root.addLayout(btn_row)
+
+    def _make_dep_card(self, dep: dict) -> tuple[QFrame, dict]:
+        """Build a single dependency card widget. Returns (frame, row_data)."""
+        card = QFrame()
+        card.setObjectName("ob-card")
+        layout = QVBoxLayout(card)
+        layout.setContentsMargins(16, 14, 16, 14)
+        layout.setSpacing(8)
+
+        # Title row: status dot + name + description
+        title_row = QHBoxLayout()
+        title_row.setSpacing(10)
+
+        status_dot = QLabel("✗")
+        status_dot.setObjectName("ob-dot-missing")
+        status_dot.setFixedWidth(20)
+
+        name_lbl = QLabel(dep["label"])
+        name_lbl.setObjectName("ob-dep-name")
+
+        desc_lbl = QLabel(dep["description"])
+        desc_lbl.setObjectName("ob-dep-desc")
+        desc_lbl.setWordWrap(True)
+
+        title_row.addWidget(status_dot)
+        title_row.addWidget(name_lbl)
+        title_row.addWidget(desc_lbl, stretch=1)
+        layout.addLayout(title_row)
+
+        # Command row: monospace box + copy button
+        cmd_text = self.install_template.format(pkg=dep["pkg"])
+        cmd_row = QHBoxLayout()
+        cmd_row.setSpacing(8)
+
+        cmd_box = QLineEdit(cmd_text)
+        cmd_box.setObjectName("ob-cmd")
+        cmd_box.setReadOnly(True)
+        cmd_box.setFont(QFont("Monospace", 10))
+
+        copy_btn = QPushButton("Copy")
+        copy_btn.setObjectName("ob-copy-btn")
+        copy_btn.setFixedWidth(64)
+        copy_btn.clicked.connect(lambda _, t=cmd_text: self._copy(t, copy_btn))
+
+        cmd_row.addWidget(cmd_box)
+        cmd_row.addWidget(copy_btn)
+        layout.addLayout(cmd_row)
+
+        return card, {
+            "card": card,
+            "status_dot": status_dot,
+            "binary": dep["binary"],
+        }
+
+    # --------------------------------------------------------------- slots --
+    def _copy(self, text: str, btn: QPushButton):
+        QApplication.clipboard().setText(text)
+        original = btn.text()
+        btn.setText("✓ Copied")
+        btn.setObjectName("ob-copy-btn-done")
+        btn.setStyleSheet("background-color: #1e4a2e; border-color: #2d7a47; color: #4ade80;")
+        QTimer.singleShot(1800, lambda: self._reset_copy_btn(btn, original))
+
+    @staticmethod
+    def _reset_copy_btn(btn: QPushButton, original: str):
+        btn.setText(original)
+        btn.setStyleSheet("")
+
+    def _recheck(self):
+        """Re-run PATH checks and update the status dots live."""
+        all_ok = True
+        for binary, row in self._dep_rows.items():
+            found = _is_present(binary)
+            dot: QLabel = row["status_dot"]
+            if found:
+                dot.setText("✓")
+                dot.setObjectName("ob-dot-ok")
+                row["card"].setObjectName("ob-card-ok")
+            else:
+                dot.setText("✗")
+                dot.setObjectName("ob-dot-missing")
+                row["card"].setObjectName("ob-card")
+                all_ok = False
+            # Force style refresh
+            dot.style().unpolish(dot)
+            dot.style().polish(dot)
+            row["card"].style().unpolish(row["card"])
+            row["card"].style().polish(row["card"])
+
+        if all_ok:
+            self.btn_recheck.setText("✓ All dependencies found!")
+            QTimer.singleShot(1200, self.accept)
+
+    # ----------------------------------------------------------------- QSS --
+    @staticmethod
+    def _qss() -> str:
+        return """
+        QDialog {
+            background-color: #121214;
+        }
+        QFrame#ob-header {
+            background: qlineargradient(
+                x1:0, y1:0, x2:1, y2:0,
+                stop:0 #0e2a35, stop:1 #121214);
+            border-bottom: 1px solid #1e3a4a;
+        }
+        QLabel#ob-title {
+            font-size: 17px;
+            font-weight: 800;
+            color: #00b4d8;
+        }
+        QLabel#ob-sub {
+            font-size: 11px;
+            color: #8a8a98;
+        }
+        QLabel#ob-label {
+            font-size: 12px;
+            color: #7a7a85;
+        }
+        QLabel#ob-distro-val {
+            font-size: 12px;
+            font-weight: bold;
+            color: #00b4d8;
+            background: #0e2a35;
+            border: 1px solid #1e3a4a;
+            border-radius: 4px;
+            padding: 2px 8px;
+        }
+        QFrame#ob-card {
             background-color: #1a1a1e;
-        }
-        QLabel {
-            color: #e2e2e9;
-            font-size: 13px;
-            min-width: 480px;
-        }
-        QPushButton {
-            background-color: #25252b;
             border: 1px solid #2d2d34;
-            border-radius: 6px;
-            padding: 8px 20px;
+            border-radius: 8px;
+        }
+        QFrame#ob-card-ok {
+            background-color: #1a2a1e;
+            border: 1px solid #2d7a47;
+            border-radius: 8px;
+        }
+        QLabel#ob-dot-missing {
+            font-size: 16px;
+            font-weight: bold;
+            color: #ef233c;
+        }
+        QLabel#ob-dot-ok {
+            font-size: 16px;
+            font-weight: bold;
+            color: #4ade80;
+        }
+        QLabel#ob-dep-name {
+            font-size: 14px;
+            font-weight: 800;
+            color: #00b4d8;
+        }
+        QLabel#ob-dep-desc {
+            font-size: 11px;
+            color: #8a8a98;
+        }
+        QLabel#ob-note {
+            font-size: 11px;
+            color: #7a7a85;
+            padding: 0px 4px;
+        }
+        QLineEdit#ob-cmd {
+            background-color: #0d0d10;
+            border: 1px solid #2d2d34;
+            border-radius: 5px;
+            padding: 6px 10px;
+            color: #a0e4f1;
+            font-size: 12px;
+        }
+        QPushButton#ob-copy-btn {
+            background-color: #25252b;
+            border: 1px solid #3a3a42;
+            border-radius: 5px;
+            padding: 6px 8px;
             color: #e2e2e9;
+            font-size: 11px;
             font-weight: bold;
         }
-        QPushButton:hover {
+        QPushButton#ob-copy-btn:hover {
             background-color: #2d2d34;
         }
-    """)
-    msg.exec()
+        QPushButton#ob-btn-recheck {
+            background-color: #0e2a35;
+            border: 1px solid #00b4d8;
+            border-radius: 6px;
+            padding: 9px 18px;
+            color: #00b4d8;
+            font-weight: bold;
+            font-size: 12px;
+        }
+        QPushButton#ob-btn-recheck:hover {
+            background-color: #1a3d4f;
+        }
+        QPushButton#ob-btn-continue {
+            background-color: #25252b;
+            border: 1px solid #3a3a42;
+            border-radius: 6px;
+            padding: 9px 18px;
+            color: #8a8a98;
+            font-weight: bold;
+            font-size: 12px;
+        }
+        QPushButton#ob-btn-continue:hover {
+            background-color: #2d2d34;
+            color: #e2e2e9;
+        }
+        """
 
 
 # ==============================================================================
@@ -1618,20 +1966,25 @@ if __name__ == "__main__":
     register_exit_handler(main_win.proc_manager)
 
     # --- Runtime dependency check ---
-    # Run AFTER MainWindow is created so the tray icon and app are visible,
-    # and so QMessageBox has a proper parent window to center on.
-    missing = check_runtime_dependencies(parent_widget=main_win)
+    # Run AFTER MainWindow is created so tray icon is visible and the dialog
+    # has a proper parent to center on.
+    missing = get_missing_deps()
     if missing:
-        # Disable wallpaper deployment controls if critical tools are absent
-        main_win.btn_apply.setEnabled(False)
-        main_win.btn_apply.setToolTip(
-            f"Disabled: missing host tools: {', '.join(missing)}\n"
-            "Install them and restart Wallpaper Motor."
-        )
-        main_win.status_bar.showMessage(
-            f"⚠ Missing dependencies: {', '.join(missing)} — see warning dialog.",
-            0  # 0 = show indefinitely until overwritten
-        )
+        dlg = OnboardingDialog(missing, parent=main_win)
+        dlg.exec()
+
+        # Re-check after dialog closes (user may have installed in terminal)
+        still_missing = get_missing_deps()
+        if still_missing:
+            names = ', '.join(d['binary'] for d in still_missing)
+            main_win.btn_apply.setEnabled(False)
+            main_win.btn_apply.setToolTip(
+                f"Disabled — missing: {names}\n"
+                "Install them and restart Wallpaper Motor."
+            )
+            main_win.status_bar.showMessage(
+                f"⚠  Missing: {names} — restart after installing.", 0
+            )
 
     # Show window
     main_win.show()

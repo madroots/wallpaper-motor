@@ -2,10 +2,13 @@ name: Build AppImage
 
 on:
   push:
-    branches:
-      - master
+    branches: [master]
   release:
     types: [created]
+
+# Use Node.js 24 to silence the deprecation warning
+env:
+  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
 
 jobs:
   build:
@@ -14,147 +17,194 @@ jobs:
 
     steps:
       # -----------------------------------------------------------------------
-      # 1. Checkout the repository
+      # 1. Checkout
       # -----------------------------------------------------------------------
       - name: Checkout repository
         uses: actions/checkout@v4
 
       # -----------------------------------------------------------------------
-      # 2. Install system build dependencies
+      # 2. System build dependencies
+      #    — libx11-dev / libxext-dev are needed to compile xwinwrap
       # -----------------------------------------------------------------------
       - name: Install system dependencies
         run: |
           sudo apt-get update -y
           sudo apt-get install -y \
-            wget \
-            fuse \
-            libfuse2 \
+            wget curl git \
+            fuse libfuse2 \
+            squashfs-tools \
             patchelf \
             desktop-file-utils \
+            libx11-dev libxext-dev \
             libglib2.0-dev \
-            libxcb-xinerama0 \
-            libxcb-icccm4 \
-            libxcb-image0 \
-            libxcb-keysyms1 \
-            libxcb-randr0 \
-            libxcb-render-util0 \
-            libxcb-shape0 \
-            libxcb-xfixes0 \
-            libxcb-xinput0 \
-            libxkbcommon-x11-0 \
-            libegl1 \
-            libgl1-mesa-dev \
-            libdbus-1-3 \
-            libglib2.0-0
+            libxcb-xinerama0 libxcb-icccm4 libxcb-image0 \
+            libxcb-keysyms1 libxcb-randr0 libxcb-render-util0 \
+            libxcb-shape0 libxcb-xfixes0 libxcb-xinput0 \
+            libxkbcommon-x11-0 libegl1 libgl1-mesa-dev \
+            libdbus-1-3 libglib2.0-0
 
       # -----------------------------------------------------------------------
-      # 3. Download a prebuilt Python 3.11 AppImage as our bundled Python base
-      #    (python-appimage project provides self-contained Python AppImages that
-      #    already have the correct GLIBC and ssl libs for wide distro compat)
+      # 3. Build xwinwrap from source and stage the binary
       # -----------------------------------------------------------------------
-      - name: Download Python 3.11 AppImage base
+      - name: Build xwinwrap from source
         run: |
-          wget -q "https://github.com/niess/python-appimage/releases/download/python3.11/python3.11.9-cp311-cp311-manylinux2014_x86_64.AppImage" \
-            -O python3-base.AppImage
+          git clone --depth=1 https://github.com/ujjwal96/xwinwrap.git xwinwrap-src
+          cd xwinwrap-src
+          make
+          file xwinwrap
+          echo "xwinwrap built OK"
+          cd ..
+
+      # -----------------------------------------------------------------------
+      # 4. Download the latest Python 3.11 AppImage dynamically
+      #    (avoids hard-coded version strings that break when upstream releases)
+      # -----------------------------------------------------------------------
+      - name: Fetch latest Python 3.11 AppImage
+        run: |
+          wget -q \
+            --header="Accept: application/vnd.github.v3+json" \
+            "https://api.github.com/repos/niess/python-appimage/releases/tags/python3.11" \
+            -O python311_release.json
+
+          PYTHON_URL=$(python3 -c "
+          import json, sys
+          data = json.load(open('python311_release.json'))
+          assets = data.get('assets', [])
+          hits = [a['browser_download_url'] for a in assets
+                  if 'manylinux2014_x86_64' in a['name'] and a['name'].endswith('.AppImage')]
+          if not hits:
+              sys.exit('ERROR: no manylinux2014_x86_64 AppImage found in release assets')
+          print(hits[0])
+          ")
+
+          echo "Downloading: ${PYTHON_URL}"
+          wget -q "${PYTHON_URL}" -O python3-base.AppImage
           chmod +x python3-base.AppImage
 
       # -----------------------------------------------------------------------
-      # 4. Extract the Python AppImage to get our portable AppDir structure
+      # 5. Extract the Python AppImage → AppDir
+      #    Then REMOVE all of Python's own metadata (desktop file, AppRun, icons)
+      #    so our files are the only ones appimagetool/mksquashfs sees at root.
+      #    This was the primary cause of exit code 8.
       # -----------------------------------------------------------------------
-      - name: Extract Python AppImage into AppDir
+      - name: Extract Python AppImage and clean metadata
         run: |
           ./python3-base.AppImage --appimage-extract
           mv squashfs-root AppDir
-          echo "Python AppDir extracted successfully."
+
+          # Strip Python's own desktop entry, AppRun, and root-level icons
+          rm -f AppDir/*.desktop AppDir/AppRun AppDir/.DirIcon AppDir/*.png AppDir/*.svg
+
+          echo "=== AppDir root after cleanup ==="
+          ls -la AppDir/
+          echo "=== Python binary ==="
           ls AppDir/usr/bin/python3*
 
       # -----------------------------------------------------------------------
-      # 5. Install Python dependencies (PyQt6 + yt-dlp) into the AppDir
+      # 6. Install Python dependencies (PyQt6 + yt-dlp) into AppDir
       # -----------------------------------------------------------------------
       - name: Install Python dependencies into AppDir
         run: |
-          # Use the bundled python to install into the bundled site-packages
           PYTHON="${PWD}/AppDir/usr/bin/python3.11"
-          
-          # Upgrade pip inside the AppDir environment
           "${PYTHON}" -m pip install --upgrade pip --quiet
-          
-          # Install requirements into the AppDir's site-packages
           "${PYTHON}" -m pip install \
             --prefix="${PWD}/AppDir/usr" \
             --no-warn-script-location \
-            PyQt6>=6.4.0 \
-            yt-dlp>=2024.1.1
-          
-          echo "Installed packages:"
+            "PyQt6>=6.4.0" \
+            "yt-dlp>=2024.1.1"
+          echo "=== Installed packages ==="
           "${PYTHON}" -m pip list
 
       # -----------------------------------------------------------------------
-      # 6. Copy application source code and assets into the AppDir
+      # 7. Bundle xwinwrap into AppDir/usr/bin
+      # -----------------------------------------------------------------------
+      - name: Bundle xwinwrap
+        run: |
+          cp xwinwrap-src/xwinwrap AppDir/usr/bin/xwinwrap
+          chmod +x AppDir/usr/bin/xwinwrap
+          echo "Bundled: $(file AppDir/usr/bin/xwinwrap)"
+
+      # -----------------------------------------------------------------------
+      # 8. Inject application source, icons, desktop file, launcher
       # -----------------------------------------------------------------------
       - name: Inject application into AppDir
         run: |
-          # Application source
+          # Source
           mkdir -p AppDir/usr/src
           cp wallpaper_manager.py AppDir/usr/src/
-          
-          # Icon — place in all standard hicolor sizes for maximum compat
+
+          # Icons at all hicolor sizes
           for SIZE in 16x16 32x32 48x48 64x64 128x128 256x256; do
             mkdir -p "AppDir/usr/share/icons/hicolor/${SIZE}/apps"
-            cp assets/wallpaper-motor.png "AppDir/usr/share/icons/hicolor/${SIZE}/apps/wallpaper-motor.png"
+            cp assets/wallpaper-motor.png \
+              "AppDir/usr/share/icons/hicolor/${SIZE}/apps/wallpaper-motor.png"
           done
-          
-          # Also place at AppDir root (required by AppImage spec for the tray icon)
+
+          # Root-level icon and .DirIcon (required by AppImage spec)
           cp assets/wallpaper-motor.png AppDir/wallpaper-motor.png
-          
-          # Desktop file
+          cp assets/wallpaper-motor.png AppDir/.DirIcon
+
+          # Desktop file — root AND standard XDG location
           mkdir -p AppDir/usr/share/applications
+          cp wallpaper-motor.desktop AppDir/wallpaper-motor.desktop
           cp wallpaper-motor.desktop AppDir/usr/share/applications/
-          cp wallpaper-motor.desktop AppDir/  # AppImage spec also wants it at root
+          desktop-file-validate AppDir/wallpaper-motor.desktop || true
+
+          # Thin launcher wrapper so Exec=wallpaper-motor resolves correctly
+          cat > AppDir/usr/bin/wallpaper-motor << 'LAUNCHER'
+          #!/bin/bash
+          exec "${APPDIR}/usr/bin/python3.11" "${APPDIR}/usr/src/wallpaper_manager.py" "$@"
+          LAUNCHER
+          chmod +x AppDir/usr/bin/wallpaper-motor
 
       # -----------------------------------------------------------------------
-      # 7. Install the custom AppRun entrypoint
+      # 9. Install AppRun entrypoint
       # -----------------------------------------------------------------------
-      - name: Install AppRun entrypoint
+      - name: Install AppRun
         run: |
           cp AppRun AppDir/AppRun
           chmod +x AppDir/AppRun
+          echo "=== Final AppDir root ==="
+          ls -la AppDir/
 
       # -----------------------------------------------------------------------
-      # 8. Verify the environment: ensure PyQt6 and yt-dlp are importable
+      # 10. Smoke test
       # -----------------------------------------------------------------------
-      - name: Smoke test bundled Python environment
+      - name: Smoke test bundled environment
         run: |
           PYTHON="${PWD}/AppDir/usr/bin/python3.11"
-          echo "=== Python version ==="
           "${PYTHON}" --version
-          echo "=== Checking PyQt6 ==="
-          "${PYTHON}" -c "import PyQt6; from PyQt6.QtWidgets import QApplication; print('PyQt6 OK')"
-          echo "=== Checking yt-dlp ==="
+          "${PYTHON}" -c "from PyQt6.QtCore import PYQT_VERSION_STR; print('PyQt6', PYQT_VERSION_STR)"
           "${PYTHON}" -c "import yt_dlp; print('yt-dlp OK')"
-          echo "=== Checking app can be parsed ==="
-          "${PYTHON}" -m py_compile AppDir/usr/src/wallpaper_manager.py && echo "wallpaper_manager.py syntax OK"
+          "${PYTHON}" -m py_compile AppDir/usr/src/wallpaper_manager.py && echo "Syntax OK"
+          file AppDir/usr/bin/xwinwrap
 
       # -----------------------------------------------------------------------
-      # 9. Download appimagetool and package the AppDir into a final AppImage
+      # 11. Download appimagetool runtime and package using mksquashfs directly.
+      #     Using mksquashfs + runtime concatenation avoids all FUSE-related
+      #     exit-code-8 failures that plague appimagetool in GitHub runners.
       # -----------------------------------------------------------------------
-      - name: Download appimagetool
+      - name: Download AppImage runtime
         run: |
-          wget -q "https://github.com/AppImage/AppImageKit/releases/download/continuous/appimagetool-x86_64.AppImage" \
-            -O appimagetool
-          chmod +x appimagetool
+          wget -q \
+            "https://github.com/AppImage/type2-runtime/releases/download/continuous/runtime-x86_64" \
+            -O runtime-x86_64
 
-      - name: Build final AppImage
-        env:
-          ARCH: x86_64
+      - name: Package AppImage
         run: |
-          # FUSE may not be available in GitHub Actions runner, use --appimage-extract-and-run
-          ./appimagetool --appimage-extract-and-run AppDir Wallpaper-Motor-x86_64.AppImage
-          echo "AppImage built:"
+          # Build squashfs filesystem from AppDir
+          mksquashfs AppDir wallpaper-motor.squashfs \
+            -root-owned -noappend -comp zstd
+
+          # Prepend the runtime to get a self-executing AppImage
+          cat runtime-x86_64 wallpaper-motor.squashfs > Wallpaper-Motor-x86_64.AppImage
+          chmod +x Wallpaper-Motor-x86_64.AppImage
+
+          echo "=== Final AppImage ==="
           ls -lh Wallpaper-Motor-x86_64.AppImage
 
       # -----------------------------------------------------------------------
-      # 10. Upload artifact (available for all push builds)
+      # 12. Upload artifact
       # -----------------------------------------------------------------------
       - name: Upload AppImage artifact
         uses: actions/upload-artifact@v4
@@ -164,9 +214,9 @@ jobs:
           retention-days: 30
 
       # -----------------------------------------------------------------------
-      # 11. Attach to GitHub Release (only runs on release events)
+      # 13. Attach to GitHub Release (release events only)
       # -----------------------------------------------------------------------
-      - name: Attach AppImage to GitHub Release
+      - name: Attach to GitHub Release
         if: github.event_name == 'release'
         uses: softprops/action-gh-release@v2
         with:
