@@ -1,0 +1,10 @@
+[Desktop Entry]
+Name=Wallpaper Motor
+Comment=Live Animated Stream Wallpaper Manager for XFCE
+Exec=wallpaper-motor %u
+Icon=wallpaper-motor
+Type=Application
+Categories=Multimedia;Video;
+Keywords=wallpaper;stream;live;mpv;xwinwrap;youtube;background;
+StartupNotify=true
+MimeType=video/mp4;video/x-matroska;video/webm;

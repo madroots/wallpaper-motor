@@ -1,0 +1,32 @@
+# Byte-compiled Python
+__pycache__/
+*.py[cod]
+*.pyd
+*.pyc
+
+# Distribution / packaging
+dist/
+build/
+*.egg-info/
+*.egg
+
+# AppImage build artifacts
+squashfs-root/
+AppDir/
+*.AppImage
+python3-base.AppImage
+appimagetool
+
+# Editor / IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Logs
+*.log
