@@ -53,7 +53,7 @@ jobs:
           echo "xwinwrap built OK"
 
       # -----------------------------------------------------------------------
-      # 4. Fetch latest Python 3.11 AppImage
+      # 4. Download the latest Python 3.11 AppImage
       # -----------------------------------------------------------------------
       - name: Fetch latest Python 3.11 AppImage
         env:
@@ -69,19 +69,18 @@ jobs:
           head -c 200 python311_release.json || true
           echo ""
 
-          PYTHON_URL=$(python3 - << 'PYEOF'
+          PYTHON_URL=$(python3 -c "
           import json, sys
-          data = json.load(open("python311_release.json"))
-          assets = data.get("assets", [])
+          data = json.load(open('python311_release.json'))
+          assets = data.get('assets', [])
           hits = [
-              a["browser_download_url"] for a in assets
-              if "manylinux2014_x86_64" in a["name"] and a["name"].endswith(".AppImage")
+              a['browser_download_url'] for a in assets
+              if 'manylinux2014_x86_64' in a['name'] and a['name'].endswith('.AppImage')
           ]
           if not hits:
-              sys.exit("ERROR: no manylinux2014_x86_64 AppImage found.")
+              sys.exit('ERROR: no manylinux2014_x86_64 AppImage found.')
           print(hits[0])
-          PYEOF
-          )
+          ")
 
           echo "Downloading: ${PYTHON_URL}"
           wget -q "${PYTHON_URL}" -O python3-base.AppImage
@@ -186,10 +185,11 @@ jobs:
 
       - name: Package AppImage
         run: |
-          # Build squashfs
+          # Build squashfs using gzip (zlib) compression for maximum compatibility
+          # since the prebuilt AppImage runtime doesn't support xz compression
           mksquashfs AppDir wallpaper-motor.squashfs \
             -noappend \
-            -comp xz \
+            -comp gzip \
             -no-progress
 
           echo "squashfs size: $(ls -lh wallpaper-motor.squashfs)"
