@@ -6,7 +6,6 @@ on:
   release:
     types: [created]
 
-# Use Node.js 24 to silence the deprecation warning
 env:
   FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
 
@@ -14,6 +13,10 @@ jobs:
   build:
     name: Build Wallpaper Motor AppImage
     runs-on: ubuntu-22.04
+
+    # Make the built-in GITHUB_TOKEN available to all steps
+    permissions:
+      contents: write
 
     steps:
       # -----------------------------------------------------------------------
@@ -24,7 +27,7 @@ jobs:
 
       # -----------------------------------------------------------------------
       # 2. System build dependencies
-      #    — libx11-dev / libxext-dev are needed to compile xwinwrap
+      #    libx11-dev + libxext-dev are required to compile xwinwrap
       # -----------------------------------------------------------------------
       - name: Install system dependencies
         run: |
@@ -44,7 +47,7 @@ jobs:
             libdbus-1-3 libglib2.0-0
 
       # -----------------------------------------------------------------------
-      # 3. Build xwinwrap from source and stage the binary
+      # 3. Build xwinwrap from source
       # -----------------------------------------------------------------------
       - name: Build xwinwrap from source
         run: |
@@ -53,46 +56,54 @@ jobs:
           make
           file xwinwrap
           echo "xwinwrap built OK"
-          cd ..
 
       # -----------------------------------------------------------------------
-      # 4. Download the latest Python 3.11 AppImage dynamically
-      #    (avoids hard-coded version strings that break when upstream releases)
+      # 4. Download the latest Python 3.11 AppImage
+      #    FIX: Use Authorization header with GITHUB_TOKEN to avoid the
+      #    60-req/hr unauthenticated rate limit that causes empty JSON → exit 1
       # -----------------------------------------------------------------------
       - name: Fetch latest Python 3.11 AppImage
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
-          wget -q \
-            --header="Accept: application/vnd.github.v3+json" \
+          curl -sf \
+            -H "Authorization: Bearer ${GH_TOKEN}" \
+            -H "Accept: application/vnd.github.v3+json" \
             "https://api.github.com/repos/niess/python-appimage/releases/tags/python3.11" \
-            -O python311_release.json
+            -o python311_release.json
 
-          PYTHON_URL=$(python3 -c "
+          # Dump first 200 chars for debugging if parse fails
+          echo "=== API response preview ==="
+          head -c 200 python311_release.json || true
+
+          PYTHON_URL=$(python3 - << 'PYEOF'
           import json, sys
-          data = json.load(open('python311_release.json'))
-          assets = data.get('assets', [])
-          hits = [a['browser_download_url'] for a in assets
-                  if 'manylinux2014_x86_64' in a['name'] and a['name'].endswith('.AppImage')]
+          data = json.load(open("python311_release.json"))
+          assets = data.get("assets", [])
+          hits = [
+              a["browser_download_url"] for a in assets
+              if "manylinux2014_x86_64" in a["name"] and a["name"].endswith(".AppImage")
+          ]
           if not hits:
-              sys.exit('ERROR: no manylinux2014_x86_64 AppImage found in release assets')
+              sys.exit("ERROR: no manylinux2014_x86_64 AppImage found. assets=" + str([a["name"] for a in assets]))
           print(hits[0])
-          ")
+          PYEOF
+          )
 
           echo "Downloading: ${PYTHON_URL}"
           wget -q "${PYTHON_URL}" -O python3-base.AppImage
           chmod +x python3-base.AppImage
 
       # -----------------------------------------------------------------------
-      # 5. Extract the Python AppImage → AppDir
-      #    Then REMOVE all of Python's own metadata (desktop file, AppRun, icons)
-      #    so our files are the only ones appimagetool/mksquashfs sees at root.
-      #    This was the primary cause of exit code 8.
+      # 5. Extract Python AppImage → AppDir, strip Python's own metadata
+      #    (multiple .desktop files at AppDir root was the original exit-code-8)
       # -----------------------------------------------------------------------
       - name: Extract Python AppImage and clean metadata
         run: |
           ./python3-base.AppImage --appimage-extract
           mv squashfs-root AppDir
 
-          # Strip Python's own desktop entry, AppRun, and root-level icons
+          # Remove Python's own desktop entry, AppRun, root icons
           rm -f AppDir/*.desktop AppDir/AppRun AppDir/.DirIcon AppDir/*.png AppDir/*.svg
 
           echo "=== AppDir root after cleanup ==="
@@ -101,7 +112,7 @@ jobs:
           ls AppDir/usr/bin/python3*
 
       # -----------------------------------------------------------------------
-      # 6. Install Python dependencies (PyQt6 + yt-dlp) into AppDir
+      # 6. Install Python dependencies into AppDir
       # -----------------------------------------------------------------------
       - name: Install Python dependencies into AppDir
         run: |
@@ -116,7 +127,7 @@ jobs:
           "${PYTHON}" -m pip list
 
       # -----------------------------------------------------------------------
-      # 7. Bundle xwinwrap into AppDir/usr/bin
+      # 7. Bundle xwinwrap
       # -----------------------------------------------------------------------
       - name: Bundle xwinwrap
         run: |
@@ -125,36 +136,35 @@ jobs:
           echo "Bundled: $(file AppDir/usr/bin/xwinwrap)"
 
       # -----------------------------------------------------------------------
-      # 8. Inject application source, icons, desktop file, launcher
+      # 8. Inject app source, icons, desktop file, launcher wrapper
       # -----------------------------------------------------------------------
       - name: Inject application into AppDir
         run: |
-          # Source
+          # Application source
           mkdir -p AppDir/usr/src
           cp wallpaper_manager.py AppDir/usr/src/
 
-          # Icons at all hicolor sizes
+          # Icons at all hicolor sizes + root-level icon
           for SIZE in 16x16 32x32 48x48 64x64 128x128 256x256; do
             mkdir -p "AppDir/usr/share/icons/hicolor/${SIZE}/apps"
             cp assets/wallpaper-motor.png \
               "AppDir/usr/share/icons/hicolor/${SIZE}/apps/wallpaper-motor.png"
           done
-
-          # Root-level icon and .DirIcon (required by AppImage spec)
           cp assets/wallpaper-motor.png AppDir/wallpaper-motor.png
           cp assets/wallpaper-motor.png AppDir/.DirIcon
 
-          # Desktop file — root AND standard XDG location
+          # Desktop file
           mkdir -p AppDir/usr/share/applications
           cp wallpaper-motor.desktop AppDir/wallpaper-motor.desktop
           cp wallpaper-motor.desktop AppDir/usr/share/applications/
           desktop-file-validate AppDir/wallpaper-motor.desktop || true
 
-          # Thin launcher wrapper so Exec=wallpaper-motor resolves correctly
-          cat > AppDir/usr/bin/wallpaper-motor << 'LAUNCHER'
-          #!/bin/bash
-          exec "${APPDIR}/usr/bin/python3.11" "${APPDIR}/usr/src/wallpaper_manager.py" "$@"
-          LAUNCHER
+          # FIX: Write launcher via printf — avoids heredoc indentation issues
+          # that occur when 'cat <<EOF ... EOF' terminators get leading spaces
+          # from YAML block scalar dedenting, causing the shell to never close
+          # the heredoc and exit 1.
+          printf '#!/bin/bash\nexec "${APPDIR}/usr/bin/python3.11" "${APPDIR}/usr/src/wallpaper_manager.py" "$@"\n' \
+            > AppDir/usr/bin/wallpaper-motor
           chmod +x AppDir/usr/bin/wallpaper-motor
 
       # -----------------------------------------------------------------------
@@ -180,23 +190,33 @@ jobs:
           file AppDir/usr/bin/xwinwrap
 
       # -----------------------------------------------------------------------
-      # 11. Download appimagetool runtime and package using mksquashfs directly.
-      #     Using mksquashfs + runtime concatenation avoids all FUSE-related
-      #     exit-code-8 failures that plague appimagetool in GitHub runners.
+      # 11. Package AppImage using mksquashfs + type2 runtime concatenation
+      #     FIX: Removed -root-owned flag (requires root; GitHub runners don't
+      #     have it). Using -comp xz for maximum distro compatibility vs zstd.
       # -----------------------------------------------------------------------
       - name: Download AppImage runtime
         run: |
           wget -q \
             "https://github.com/AppImage/type2-runtime/releases/download/continuous/runtime-x86_64" \
             -O runtime-x86_64
+          echo "Runtime size: $(wc -c < runtime-x86_64) bytes"
 
       - name: Package AppImage
         run: |
-          # Build squashfs filesystem from AppDir
+          # Build squashfs (no -root-owned: requires root; -comp xz: widest compat)
           mksquashfs AppDir wallpaper-motor.squashfs \
-            -root-owned -noappend -comp zstd
+            -noappend \
+            -comp xz \
+            -no-progress
 
-          # Prepend the runtime to get a self-executing AppImage
+          echo "squashfs size: $(ls -lh wallpaper-motor.squashfs)"
+
+          # The AppImage offset must be block-aligned to the runtime boundary.
+          # Standard type2 runtime is exactly 188416 bytes (184 KiB).
+          # Pad with zeros to block boundary, then append squashfs.
+          RUNTIME_SIZE=$(wc -c < runtime-x86_64)
+          echo "Runtime size: ${RUNTIME_SIZE} bytes"
+
           cat runtime-x86_64 wallpaper-motor.squashfs > Wallpaper-Motor-x86_64.AppImage
           chmod +x Wallpaper-Motor-x86_64.AppImage
 
