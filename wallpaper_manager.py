@@ -37,7 +37,7 @@ from PyQt6.QtWidgets import (
     QComboBox, QFormLayout, QDialog, QDialogButtonBox, QCheckBox,
     QStackedWidget, QSystemTrayIcon, QMenu, QMessageBox, QFrame,
     QSplitter, QStatusBar, QSizePolicy, QFileDialog, QRadioButton,
-    QTabWidget
+    QTabWidget, QProgressBar, QSpinBox
 )
 from PyQt6.QtGui import QIcon, QFont, QAction, QColor, QPainter, QPen, QBrush, QPolygonF, QFontMetrics
 
@@ -1266,20 +1266,39 @@ class StreamDialog(QDialog):
 
 
 class DownloadThread(QThread):
-    progress = pyqtSignal(str)
+    progress = pyqtSignal(int)
+    status_msg = pyqtSignal(str)
     finished = pyqtSignal(bool, str) # success, message or final path
     
-    def __init__(self, url, duration, output_dir, is_live):
+    def __init__(self, url, start_time, duration, output_dir):
         super().__init__()
         self.url = url
+        self.start_time = start_time
         self.duration = duration
         self.output_dir = output_dir
-        self.is_live = is_live
+        self.target_dur = None
         
+    def parse_time_to_seconds(self, time_str):
+        if ":" in time_str:
+            parts = time_str.split(":")
+            try:
+                hours = float(parts[0])
+                minutes = float(parts[1])
+                seconds = float(parts[2])
+                return hours * 3600 + minutes * 60 + seconds
+            except ValueError:
+                return 0.0
+        else:
+            try:
+                return float(time_str)
+            except ValueError:
+                return 0.0
+
     def run(self):
         try:
             import hashlib
-            url_hash = hashlib.md5(self.url.encode('utf-8')).hexdigest()
+            hash_input = f"{self.url}_{self.start_time}_{self.duration}"
+            url_hash = hashlib.md5(hash_input.encode('utf-8')).hexdigest()
             os.makedirs(self.output_dir, exist_ok=True)
             final_path = os.path.join(self.output_dir, f"{url_hash}.mp4")
             
@@ -1289,13 +1308,19 @@ class DownloadThread(QThread):
                 except Exception:
                     pass
             
-            self.progress.emit("Starting download...")
+            self.status_msg.emit("Initializing download...")
             
+            downloader_args = []
+            if self.start_time and self.start_time not in ("0", "00:00:00", ""):
+                downloader_args.append(f"-ss {self.start_time}")
             if self.duration != 'whole':
+                downloader_args.append(f"-t {self.duration}")
+                
+            if downloader_args:
                 cmd = [
                     "yt-dlp",
                     "--downloader", "ffmpeg",
-                    "--downloader-args", f"ffmpeg:-t {self.duration}",
+                    "--downloader-args", f"ffmpeg:{' '.join(downloader_args)}",
                     "-f", "bestvideo[ext=mp4]+bestaudio[ext=m4a]/best[ext=mp4]/best",
                     "--merge-output-format", "mp4",
                     "-o", final_path,
@@ -1319,27 +1344,334 @@ class DownloadThread(QThread):
                 universal_newlines=True
             )
             
+            has_started_download = False
             for line in process.stdout:
                 line = line.strip()
                 if not line:
                     continue
-                if "[download]" in line and "%" in line:
+                
+                # Check for merging step
+                if "[Merger]" in line or "Merging formats" in line:
+                    self.status_msg.emit("Merging video and audio streams...")
+                    self.progress.emit(95)
+                # Check for progress percentage for standard yt-dlp download
+                elif "[download]" in line and "%" in line:
+                    if not has_started_download:
+                        self.status_msg.emit("Downloading video data...")
+                        has_started_download = True
                     parts = line.split()
                     for p in parts:
                         if "%" in p:
-                            self.progress.emit(f"Downloading: {p}")
+                            try:
+                                pct = int(float(p.replace("%", "")))
+                                self.progress.emit(min(90, pct))
+                            except ValueError:
+                                pass
                             break
-                elif "ffmpeg" in line.lower() or "downloading" in line.lower():
-                    self.progress.emit(line)
-                    
+                # Check for ffmpeg download progress (seeking/trimming via ffmpeg)
+                elif "time=" in line:
+                    if not has_started_download:
+                        self.status_msg.emit("Extracting/Downloading clip...")
+                        has_started_download = True
+                    parts = line.split("time=")
+                    if len(parts) > 1:
+                        time_part = parts[1].split()[0]
+                        current_sec = self.parse_time_to_seconds(time_part)
+                        if self.target_dur and self.target_dur > 0:
+                            pct = int((current_sec / self.target_dur) * 100)
+                            pct = min(95, max(0, pct))
+                            self.progress.emit(pct)
+                            
             process.wait()
             
             if process.returncode == 0 and os.path.exists(final_path):
+                self.progress.emit(100)
                 self.finished.emit(True, final_path)
             else:
-                self.finished.emit(False, "yt-dlp exited with non-zero code or output file missing.")
+                self.finished.emit(False, "yt-dlp exited with non-zero code or output file is missing.")
         except Exception as e:
             self.finished.emit(False, str(e))
+
+
+class DownloadDialog(QDialog):
+    def __init__(self, stream, parent=None):
+        super().__init__(parent)
+        self.stream = stream
+        self.parent_win = parent
+        self.duration_val = stream.get("duration")
+        self.filesize_val = stream.get("filesize_approx")
+        self.fetcher = None
+        self.dl_thread = None
+        
+        self.setWindowTitle("Download Video Copy")
+        self.setMinimumWidth(500)
+        self.setWindowIcon(create_app_icon())
+        self.setStyleSheet("""
+            QDialog {
+                background-color: #1a1a1e;
+            }
+            QLabel {
+                font-weight: bold;
+                color: #e2e2e9;
+            }
+            QLineEdit, QComboBox, QSpinBox {
+                background-color: #121214;
+                border: 1px solid #2d2d34;
+                border-radius: 6px;
+                padding: 8px 12px;
+                color: #e2e2e9;
+            }
+            QLineEdit:focus, QComboBox:focus, QSpinBox:focus {
+                border-color: #00b4d8;
+            }
+            QProgressBar {
+                background-color: #121214;
+                border: 1px solid #2d2d34;
+                border-radius: 6px;
+                text-align: center;
+                color: #ffffff;
+                font-weight: bold;
+            }
+            QProgressBar::chunk {
+                background-color: #00b4d8;
+                border-radius: 5px;
+            }
+        """)
+        
+        self.init_ui()
+        
+        # If metadata is missing, fetch it in background
+        if not self.duration_val or not self.filesize_val:
+            self.fetch_metadata()
+            
+    def init_ui(self):
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(20, 20, 20, 20)
+        layout.setSpacing(16)
+        
+        # Header Info
+        header_layout = QVBoxLayout()
+        header_layout.setSpacing(4)
+        
+        self.lbl_stream_name = QLabel(f"Source: {self.stream.get('name', 'Unnamed')}")
+        self.lbl_stream_name.setStyleSheet("font-size: 16px; font-weight: 800; color: #00b4d8;")
+        header_layout.addWidget(self.lbl_stream_name)
+        
+        lbl_url = QLabel(self.stream.get("url", ""))
+        lbl_url.setStyleSheet("color: #7a7a85; font-size: 11px;")
+        lbl_url.setWordWrap(True)
+        header_layout.addWidget(lbl_url)
+        
+        layout.addLayout(header_layout)
+        
+        # Divider
+        divider = QFrame()
+        divider.setFrameShape(QFrame.Shape.HLine)
+        divider.setFrameShadow(QFrame.Shadow.Sunken)
+        divider.setStyleSheet("background-color: #28282f; max-height: 1px; border: none;")
+        layout.addWidget(divider)
+        
+        # Form Config Layout
+        form = QFormLayout()
+        form.setSpacing(12)
+        form.setLabelAlignment(Qt.AlignmentFlag.AlignRight)
+        
+        # Trim Start Time Point
+        self.txt_start_time = QLineEdit("00:00:00")
+        self.txt_start_time.setPlaceholderText("e.g. 00:01:30 or 90")
+        self.txt_start_time.setToolTip("Custom start time to seek. Format: HH:MM:SS or raw seconds.")
+        
+        lbl_start_help = QLabel("Trim Start Position (HH:MM:SS or seconds)")
+        lbl_start_help.setStyleSheet("color: #a0a0ab; font-size: 11px; font-weight: normal;")
+        
+        start_container = QVBoxLayout()
+        start_container.setSpacing(4)
+        start_container.addWidget(self.txt_start_time)
+        start_container.addWidget(lbl_start_help)
+        
+        form.addRow("Start Point:", start_container)
+        
+        # Duration Mode
+        self.combo_duration = QComboBox()
+        self.combo_duration.addItem("30 Seconds", 30)
+        self.combo_duration.addItem("60 Seconds", 60)
+        self.combo_duration.addItem("120 Seconds", 120)
+        self.combo_duration.addItem("Whole Video", "whole")
+        self.combo_duration.addItem("Custom Duration...", "custom")
+        self.combo_duration.currentIndexChanged.connect(self.on_duration_changed)
+        
+        form.addRow("Duration Limit:", self.combo_duration)
+        
+        # Custom Duration spinbox (hidden by default)
+        self.lbl_custom_dur = QLabel("Custom Duration (sec):")
+        self.spin_custom_dur = QSpinBox()
+        self.spin_custom_dur.setRange(1, 99999)
+        self.spin_custom_dur.setValue(30)
+        self.spin_custom_dur.valueChanged.connect(self.update_estimated_size)
+        self.spin_custom_dur.setVisible(False)
+        self.lbl_custom_dur.setVisible(False)
+        
+        form.addRow(self.lbl_custom_dur, self.spin_custom_dur)
+        
+        # Size Estimation
+        self.lbl_est_size = QLabel("Estimated Size: Estimating...")
+        self.lbl_est_size.setStyleSheet("color: #a0a0ab; font-style: italic;")
+        form.addRow("", self.lbl_est_size)
+        
+        layout.addLayout(form)
+        
+        # Divider
+        divider2 = QFrame()
+        divider2.setFrameShape(QFrame.Shape.HLine)
+        divider2.setFrameShadow(QFrame.Shadow.Sunken)
+        divider2.setStyleSheet("background-color: #28282f; max-height: 1px; border: none;")
+        layout.addWidget(divider2)
+        
+        # Progress Info
+        self.progress_bar = QProgressBar()
+        self.progress_bar.setRange(0, 100)
+        self.progress_bar.setValue(0)
+        self.progress_bar.setVisible(False)
+        layout.addWidget(self.progress_bar)
+        
+        self.lbl_progress_status = QLabel("")
+        self.lbl_progress_status.setStyleSheet("color: #00b4d8; font-size: 12px;")
+        self.lbl_progress_status.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self.lbl_progress_status.setVisible(False)
+        layout.addWidget(self.lbl_progress_status)
+        
+        # Buttons Layout
+        btn_layout = QHBoxLayout()
+        btn_layout.setSpacing(10)
+        btn_layout.addStretch()
+        
+        self.btn_start = QPushButton("Start Download")
+        self.btn_start.setObjectName("btn-apply")
+        self.btn_start.clicked.connect(self.start_download)
+        
+        self.btn_cancel = QPushButton("Cancel")
+        self.btn_cancel.clicked.connect(self.reject)
+        
+        btn_layout.addWidget(self.btn_cancel)
+        btn_layout.addWidget(self.btn_start)
+        layout.addLayout(btn_layout)
+        
+        self.update_estimated_size()
+        
+    def fetch_metadata(self):
+        self.lbl_est_size.setText("Estimating size: Fetching video details...")
+        self.fetcher = MetadataFetcher(self.stream["url"])
+        self.fetcher.metadata_fetched.connect(self.on_metadata_fetched)
+        self.fetcher.error_occurred.connect(self.on_metadata_error)
+        self.fetcher.start()
+        
+    def on_metadata_fetched(self, metadata):
+        self.duration_val = metadata.get("duration")
+        self.filesize_val = metadata.get("filesize_approx")
+        self.stream["duration"] = self.duration_val
+        self.stream["filesize_approx"] = self.filesize_val
+        if self.parent_win:
+            self.parent_win.db.save_streams()
+        self.update_estimated_size()
+        
+    def on_metadata_error(self, err):
+        self.lbl_est_size.setText("Estimated Size: Unknown (failed to fetch details)")
+        
+    def on_duration_changed(self):
+        is_custom = self.combo_duration.currentData() == "custom"
+        self.lbl_custom_dur.setVisible(is_custom)
+        self.spin_custom_dur.setVisible(is_custom)
+        self.update_estimated_size()
+        
+    def update_estimated_size(self):
+        if not self.filesize_val or not self.duration_val:
+            self.lbl_est_size.setText("Estimated Size: Unknown (fetching metadata...)")
+            return
+            
+        dur_mode = self.combo_duration.currentData()
+        if dur_mode == "whole":
+            target_dur = self.duration_val
+        elif dur_mode == "custom":
+            target_dur = self.spin_custom_dur.value()
+        else:
+            target_dur = int(dur_mode)
+            
+        if target_dur is None or self.duration_val <= 0:
+            self.lbl_est_size.setText("Estimated Size: Unknown")
+            return
+            
+        ratio = min(1.0, target_dur / self.duration_val)
+        est_bytes = self.filesize_val * ratio
+        est_mb = est_bytes / (1024 * 1024)
+        self.lbl_est_size.setText(f"Estimated Size: ~{est_mb:.1f} MB (Total video: {self.filesize_val / (1024*1024):.1f} MB)")
+        
+    def start_download(self):
+        self.combo_duration.setEnabled(False)
+        self.spin_custom_dur.setEnabled(False)
+        self.txt_start_time.setEnabled(False)
+        self.btn_start.setEnabled(False)
+        
+        self.progress_bar.setVisible(True)
+        self.lbl_progress_status.setVisible(True)
+        self.lbl_progress_status.setText("Initializing download...")
+        
+        dur_mode = self.combo_duration.currentData()
+        if dur_mode == "whole":
+            duration = "whole"
+            target_dur = self.duration_val
+        elif dur_mode == "custom":
+            duration = self.spin_custom_dur.value()
+            target_dur = duration
+        else:
+            duration = int(dur_mode)
+            target_dur = duration
+            
+        start_time = self.txt_start_time.text().strip()
+        local_dir = os.path.join(Path.home(), ".local", "share", "wallpaper-motor", "videos")
+        
+        self.dl_thread = DownloadThread(self.stream["url"], start_time, duration, local_dir)
+        self.dl_thread.progress.connect(self.progress_bar.setValue)
+        self.dl_thread.status_msg.connect(self.lbl_progress_status.setText)
+        self.dl_thread.finished.connect(self.on_download_finished)
+        self.dl_thread.target_dur = target_dur
+        self.dl_thread.start()
+        
+    def on_download_finished(self, success, result):
+        if success:
+            self.lbl_progress_status.setText("Download complete! Saving stream...")
+            self.progress_bar.setValue(100)
+            
+            new_stream = {
+                "name": f"[dl] {self.stream['name']}",
+                "category": self.stream.get("category", "General"),
+                "url": result,
+                "favorite": False,
+                "is_local": True,
+                "is_live": False
+            }
+            
+            if self.parent_win:
+                self.parent_win.db.streams.append(new_stream)
+                self.parent_win.db.save_streams()
+                self.parent_win.populate_stream_list()
+                self.parent_win.status_bar.showMessage(f"Downloaded local loop: {new_stream['name']}", 4000)
+                
+            QMessageBox.information(self, "Success", f"Successfully downloaded local copy of '{self.stream['name']}' as a local video loop.")
+            self.accept()
+        else:
+            self.lbl_progress_status.setText(f"Failed: {result}")
+            self.lbl_progress_status.setStyleSheet("color: #ef233c; font-weight: bold;")
+            self.combo_duration.setEnabled(True)
+            self.spin_custom_dur.setEnabled(True)
+            self.txt_start_time.setEnabled(True)
+            self.btn_start.setEnabled(True)
+            QMessageBox.critical(self, "Download Error", f"An error occurred during download:\n{result}")
+            
+    def closeEvent(self, event):
+        if self.dl_thread and self.dl_thread.isRunning():
+            self.dl_thread.terminate()
+            self.dl_thread.wait()
+        event.accept()
 
 
 # ==============================================================================
@@ -1477,86 +1809,20 @@ class MainWindow(QMainWindow):
         self.btn_prev_stop = QPushButton("Stop Preview")
         self.btn_prev_stop.clicked.connect(self.stop_selected_preview)
         
+        self.btn_download = QPushButton("Download Copy 📥")
+        self.btn_download.clicked.connect(self.open_download_dialog)
+        self.btn_download.setEnabled(False)
+        
         self.lbl_prev_status = QLabel("Preview Status: Idle")
         self.lbl_prev_status.setStyleSheet("color: #7a7a85; font-size: 12px;")
         
         preview_ctrls.addWidget(self.btn_prev_play)
         preview_ctrls.addWidget(self.btn_prev_stop)
+        preview_ctrls.addWidget(self.btn_download)
         preview_ctrls.addWidget(self.lbl_prev_status)
         preview_ctrls.addStretch()
         
         main_panel_layout.addLayout(preview_ctrls)
-        
-        # ----------------------------------------------------------------------
-        # Download Panel / Frame
-        # ----------------------------------------------------------------------
-        self.download_frame = QFrame()
-        self.download_frame.setObjectName("download-frame")
-        self.download_frame.setStyleSheet("""
-            QFrame#download-frame {
-                background-color: #1a1a1e;
-                border: 1px solid #28282f;
-                border-radius: 8px;
-                padding: 12px;
-            }
-        """)
-        download_layout = QVBoxLayout(self.download_frame)
-        download_layout.setSpacing(10)
-        
-        lbl_download_header = QLabel("Local Video Downloader (yt-dlp)")
-        lbl_download_header.setStyleSheet("font-weight: bold; color: #e2e2e9; font-size: 13px;")
-        download_layout.addWidget(lbl_download_header)
-        
-        # Duration selection row
-        duration_row = QHBoxLayout()
-        duration_row.setSpacing(10)
-        
-        lbl_dur = QLabel("Download Duration:")
-        lbl_dur.setStyleSheet("font-weight: 500; color: #a0a0ab;")
-        duration_row.addWidget(lbl_dur)
-        
-        self.combo_duration = QComboBox()
-        self.combo_duration.addItem("30 Seconds", 30)
-        self.combo_duration.addItem("60 Seconds", 60)
-        self.combo_duration.addItem("120 Seconds", 120)
-        self.combo_duration.addItem("Whole Video", "whole")
-        duration_row.addWidget(self.combo_duration)
-        
-        self.btn_download = QPushButton("Download Local Loop")
-        self.btn_download.clicked.connect(self.start_download)
-        duration_row.addWidget(self.btn_download)
-        
-        duration_row.addStretch()
-        download_layout.addLayout(duration_row)
-        
-        # Download status/progress label
-        self.lbl_download_status = QLabel("No local download found.")
-        self.lbl_download_status.setStyleSheet("color: #7a7a85; font-size: 12px;")
-        download_layout.addWidget(self.lbl_download_status)
-        
-        # Playback Mode Toggle Row
-        toggle_row = QHBoxLayout()
-        toggle_row.setSpacing(15)
-        
-        lbl_mode = QLabel("Playback Mode:")
-        lbl_mode.setStyleSheet("font-weight: 500; color: #a0a0ab;")
-        toggle_row.addWidget(lbl_mode)
-        
-        self.radio_run_live = QRadioButton("Run Live Stream (URL)")
-        self.radio_run_live.setStyleSheet("color: #e2e2e9; font-weight: bold;")
-        self.radio_run_live.toggled.connect(self.on_playback_mode_toggled)
-        toggle_row.addWidget(self.radio_run_live)
-        
-        self.radio_run_local = QRadioButton("Run Local Loop")
-        self.radio_run_local.setStyleSheet("color: #e2e2e9; font-weight: bold;")
-        self.radio_run_local.toggled.connect(self.on_playback_mode_toggled)
-        toggle_row.addWidget(self.radio_run_local)
-        
-        toggle_row.addStretch()
-        download_layout.addLayout(toggle_row)
-        
-        main_panel_layout.addWidget(self.download_frame)
-        self.download_frame.setVisible(False)
         
         # Horizontal Divider
         divider = QFrame()
@@ -1840,116 +2106,25 @@ class MainWindow(QMainWindow):
         self.btn_edit.setEnabled(has_selection)
         self.btn_delete.setEnabled(has_selection)
         
-        if not has_selection:
-            self.download_frame.setVisible(False)
-            return
-            
-        stream = current_item.data(Qt.ItemDataRole.UserRole)
-        
-        if stream.get("is_local", False):
-            self.download_frame.setVisible(False)
+        if has_selection:
+            stream = current_item.data(Qt.ItemDataRole.UserRole)
+            can_download = (not stream.get("is_local", False)) and (not stream.get("is_live", False))
+            self.btn_download.setEnabled(can_download)
         else:
-            self.download_frame.setVisible(True)
-            
-            # Enable/disable 'Whole Video' if stream is live
-            is_live = stream.get("is_live", False)
-            item = self.combo_duration.model().item(3)
-            if item:
-                item.setEnabled(not is_live)
-            if is_live and self.combo_duration.currentIndex() == 3:
-                self.combo_duration.setCurrentIndex(0)
-                
-            # Check if local downloaded file exists
-            import hashlib
-            url_hash = hashlib.md5(stream["url"].encode('utf-8')).hexdigest()
-            local_dir = os.path.join(Path.home(), ".local", "share", "wallpaper-motor", "videos")
-            local_file = os.path.join(local_dir, f"{url_hash}.mp4")
-            
-            local_exists = os.path.exists(local_file)
-            self.radio_run_local.setEnabled(local_exists)
-            
-            current_mode = stream.get("playback_mode", "live")
-            if current_mode == "local" and not local_exists:
-                current_mode = "live"
-                stream["playback_mode"] = "live"
-                self.db.save_streams()
-                
-            self.radio_run_live.blockSignals(True)
-            self.radio_run_local.blockSignals(True)
-            if current_mode == "local":
-                self.radio_run_local.setChecked(True)
-            else:
-                self.radio_run_live.setChecked(True)
-            self.radio_run_live.blockSignals(False)
-            self.radio_run_local.blockSignals(False)
-            
-            if local_exists:
-                size_mb = os.path.getsize(local_file) / (1024 * 1024)
-                self.lbl_download_status.setText(f"Local copy exists ({size_mb:.1f} MB). Ready to loop.")
-                self.lbl_download_status.setStyleSheet("color: #4ade80; font-size: 12px;")
-            else:
-                self.lbl_download_status.setText("No local copy downloaded yet.")
-                self.lbl_download_status.setStyleSheet("color: #7a7a85; font-size: 12px;")
+            self.btn_download.setEnabled(False)
         
         # Seamlessly update preview on selection swap if it's already active
         if has_selection and self.preview_stack.currentIndex() == 1:
             self.play_selected_preview()
             
-    def start_download(self):
+    def open_download_dialog(self):
         current_item = self.lst_streams.currentItem()
         if not current_item:
             return
         stream = current_item.data(Qt.ItemDataRole.UserRole)
         
-        self.btn_download.setEnabled(False)
-        self.combo_duration.setEnabled(False)
-        self.lbl_download_status.setText("Preparing download...")
-        self.lbl_download_status.setStyleSheet("color: #00b4d8; font-size: 12px;")
-        
-        url = stream["url"]
-        duration = self.combo_duration.currentData()
-        local_dir = os.path.join(Path.home(), ".local", "share", "wallpaper-motor", "videos")
-        is_live = stream.get("is_live", False)
-        
-        self.dl_thread = DownloadThread(url, duration, local_dir, is_live)
-        self.dl_thread.progress.connect(self.on_download_progress)
-        self.dl_thread.finished.connect(self.on_download_finished)
-        self.dl_thread.start()
-        
-    def on_download_progress(self, msg):
-        self.lbl_download_status.setText(msg)
-        
-    def on_download_finished(self, success, result):
-        self.btn_download.setEnabled(True)
-        self.combo_duration.setEnabled(True)
-        
-        current_item = self.lst_streams.currentItem()
-        if not current_item:
-            return
-        stream = current_item.data(Qt.ItemDataRole.UserRole)
-        
-        if success:
-            size_mb = os.path.getsize(result) / (1024 * 1024)
-            self.lbl_download_status.setText(f"Download complete! ({size_mb:.1f} MB). Ready to loop.")
-            self.lbl_download_status.setStyleSheet("color: #4ade80; font-size: 12px;")
-            self.radio_run_local.setEnabled(True)
-            self.radio_run_local.setChecked(True)
-        else:
-            self.lbl_download_status.setText(f"Download failed: {result}")
-            self.lbl_download_status.setStyleSheet("color: #ef233c; font-size: 12px;")
-            
-    def on_playback_mode_toggled(self):
-        current_item = self.lst_streams.currentItem()
-        if not current_item:
-            return
-        stream = current_item.data(Qt.ItemDataRole.UserRole)
-        
-        mode = "local" if self.radio_run_local.isChecked() else "live"
-        stream["playback_mode"] = mode
-        self.db.save_streams()
-        
-        # Stop preview or wallpaper if they are active to allow applying new mode
-        self.stop_selected_preview()
+        dlg = DownloadDialog(stream, parent=self)
+        dlg.exec()
             
     def filter_streams(self):
         query = self.txt_search.text().lower().strip()
@@ -2079,14 +2254,6 @@ class MainWindow(QMainWindow):
         if not url:
             return
             
-        if not stream.get("is_local", False) and stream.get("playback_mode", "live") == "local":
-            import hashlib
-            url_hash = hashlib.md5(url.encode('utf-8')).hexdigest()
-            local_dir = os.path.join(Path.home(), ".local", "share", "wallpaper-motor", "videos")
-            local_file = os.path.join(local_dir, f"{url_hash}.mp4")
-            if os.path.exists(local_file):
-                url = local_file
-                
         self.preview_stack.setCurrentIndex(1)
         self.lbl_prev_status.setText("Preview Status: Buffering/Playing...")
         
@@ -2109,14 +2276,6 @@ class MainWindow(QMainWindow):
         if not url:
             return
             
-        if not stream.get("is_local", False) and stream.get("playback_mode", "live") == "local":
-            import hashlib
-            url_hash = hashlib.md5(url.encode('utf-8')).hexdigest()
-            local_dir = os.path.join(Path.home(), ".local", "share", "wallpaper-motor", "videos")
-            local_file = os.path.join(local_dir, f"{url_hash}.mp4")
-            if os.path.exists(local_file):
-                url = local_file
-                
         resolution = self.get_selected_resolution()
         if not resolution:
             QMessageBox.warning(self, "Invalid Geometry", "Please specify a valid screen geometry.")
