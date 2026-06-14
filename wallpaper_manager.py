@@ -36,9 +36,136 @@ from PyQt6.QtWidgets import (
     QListWidget, QListWidgetItem, QPushButton, QLabel, QLineEdit,
     QComboBox, QFormLayout, QDialog, QDialogButtonBox, QCheckBox,
     QStackedWidget, QSystemTrayIcon, QMenu, QMessageBox, QFrame,
-    QSplitter, QStatusBar, QSizePolicy, QFileDialog
+    QSplitter, QStatusBar, QSizePolicy, QFileDialog, QRadioButton,
+    QTabWidget
 )
-from PyQt6.QtGui import QIcon, QFont, QAction, QColor, QPainter, QPen, QBrush, QPolygonF
+from PyQt6.QtGui import QIcon, QFont, QAction, QColor, QPainter, QPen, QBrush, QPolygonF, QFontMetrics
+
+# ==============================================================================
+# Wayland Block & Elided Label Helpers
+# ==============================================================================
+
+class WaylandErrorDialog(QDialog):
+    """
+    Shown at startup when a Wayland session is detected.
+    Halts the onboarding flow and presents an unskippable error message.
+    """
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setWindowTitle("Wayland Session Detected")
+        self.setMinimumWidth(500)
+        self.setWindowIcon(create_app_icon())
+        self.setStyleSheet("""
+            QDialog {
+                background-color: #121214;
+            }
+            QFrame#we-header {
+                background: qlineargradient(
+                    x1:0, y1:0, x2:1, y2:0,
+                    stop:0 #4a1e1e, stop:1 #121214);
+                border-bottom: 1px solid #7a2d2d;
+            }
+            QLabel#we-title {
+                font-size: 17px;
+                font-weight: 800;
+                color: #ef233c;
+            }
+            QLabel#we-body {
+                font-size: 13px;
+                color: #e2e2e9;
+                line-height: 1.4;
+            }
+            QPushButton#we-btn-exit {
+                background-color: #d90429;
+                border: 1px solid #b3001e;
+                border-radius: 6px;
+                padding: 9px 18px;
+                color: #ffffff;
+                font-weight: bold;
+                font-size: 12px;
+            }
+            QPushButton#we-btn-exit:hover {
+                background-color: #ef233c;
+            }
+        """)
+        self._build_ui()
+
+    def _build_ui(self):
+        root = QVBoxLayout(self)
+        root.setContentsMargins(0, 0, 0, 0)
+        root.setSpacing(20)
+
+        # Header banner
+        header = QFrame()
+        header.setObjectName("we-header")
+        header.setFixedHeight(90)
+        h_layout = QHBoxLayout(header)
+        h_layout.setContentsMargins(24, 0, 24, 0)
+        h_layout.setSpacing(16)
+
+        icon_lbl = QLabel()
+        icon_lbl.setPixmap(create_app_icon().pixmap(QSize(52, 52)))
+        h_layout.addWidget(icon_lbl)
+
+        text_col = QVBoxLayout()
+        text_col.setSpacing(2)
+        title_lbl = QLabel("Incompatible Environment")
+        title_lbl.setObjectName("we-title")
+        text_col.addWidget(title_lbl)
+        h_layout.addLayout(text_col)
+        root.addWidget(header)
+
+        # Message body
+        body_lbl = QLabel(
+            "Wayland Session Detected. This application relies directly on X11 root windows "
+            "via xwinwrap and cannot function on Wayland. Please log out and switch to an "
+            "X11/XFCE session to continue."
+        )
+        body_lbl.setObjectName("we-body")
+        body_lbl.setWordWrap(True)
+        body_lbl.setContentsMargins(24, 0, 24, 0)
+        root.addWidget(body_lbl)
+
+        # Exit button row
+        btn_row = QHBoxLayout()
+        btn_row.setContentsMargins(24, 0, 24, 24)
+        btn_row.addStretch()
+
+        btn_exit = QPushButton("Exit Application")
+        btn_exit.setObjectName("we-btn-exit")
+        btn_exit.clicked.connect(self.accept)
+        btn_row.addWidget(btn_exit)
+        root.addLayout(btn_row)
+
+    # Disable escaping or closing the window without exiting
+    def reject(self):
+        self.accept()
+
+
+class ElidedLabel(QLabel):
+    """A QLabel that automatically truncates its text with an ellipsis when resized."""
+    def __init__(self, text="", parent=None):
+        super().__init__(text, parent)
+        self.full_text = text
+        self.setToolTip(text)
+        
+    def setText(self, text):
+        self.full_text = text
+        self.setToolTip(text)
+        super().setText(text)
+        self.update_elided_text()
+        
+    def resizeEvent(self, event):
+        super().resizeEvent(event)
+        self.update_elided_text()
+        
+    def update_elided_text(self):
+        fm = QFontMetrics(self.font())
+        width = self.width() - 4
+        if width <= 0:
+            return
+        elided = fm.elidedText(self.full_text, Qt.TextElideMode.ElideRight, width)
+        super().setText(elided)
 
 # ==============================================================================
 # Dynamic Icon Generation (with $APPDIR-aware path resolution)
@@ -178,33 +305,7 @@ class DatabaseManager:
             self.config_dir.mkdir(parents=True, exist_ok=True)
             
         if not self.config_file.exists():
-            # Populate with excellent live streams out of the box
-            self.streams = [
-                {
-                    "name": "Lofi Girl (Study Beats)",
-                    "category": "Lofi",
-                    "url": "https://www.youtube.com/watch?v=jfKfPfyJRdk",
-                    "favorite": True
-                },
-                {
-                    "name": "NASA Earth Live (ISS)",
-                    "category": "Space",
-                    "url": "https://www.youtube.com/watch?v=jPTD2snYc84",
-                    "favorite": False
-                },
-                {
-                    "name": "Tokyo Rain & Neon Walk",
-                    "category": "Rain",
-                    "url": "https://www.youtube.com/watch?v=g97l2T0GvOk",
-                    "favorite": False
-                },
-                {
-                    "name": "Synthwave Chill Radio",
-                    "category": "Synthwave",
-                    "url": "https://www.youtube.com/watch?v=4xDzrJKXOOY",
-                    "favorite": False
-                }
-            ]
+            self.streams = []
             self.save_streams()
         else:
             try:
@@ -838,8 +939,10 @@ class StreamItemWidget(QWidget):
         info_layout = QVBoxLayout()
         info_layout.setSpacing(4)
         
-        self.lbl_name = QLabel(self.stream.get("name", "Unnamed Stream"))
+        self.lbl_name = ElidedLabel(self.stream.get("name", "Unnamed Stream"))
         self.lbl_name.setStyleSheet("font-weight: bold; font-size: 13px; color: #e2e2e9;")
+        self.lbl_name.setMinimumWidth(10)
+        self.lbl_name.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Preferred)
         
         self.lbl_category = QLabel(self.stream.get("category", "General").upper())
         self.lbl_category.setStyleSheet("""
@@ -859,8 +962,7 @@ class StreamItemWidget(QWidget):
         info_layout.addWidget(self.lbl_name)
         info_layout.addWidget(self.lbl_category)
         
-        layout.addLayout(info_layout)
-        layout.addStretch()
+        layout.addLayout(info_layout, 1)
         
         # Star toggle button
         self.btn_fav = QPushButton()
@@ -894,8 +996,9 @@ class StreamItemWidget(QWidget):
 # UI Component: Add / Edit Stream Dialog
 # ==============================================================================
 
-class TitleFetcher(QThread):
-    title_fetched = pyqtSignal(str)
+class MetadataFetcher(QThread):
+    metadata_fetched = pyqtSignal(dict)
+    error_occurred = pyqtSignal(str)
     
     def __init__(self, url):
         super().__init__()
@@ -903,19 +1006,22 @@ class TitleFetcher(QThread):
         
     def run(self):
         try:
-            cmd = ["yt-dlp", "--get-title", self.url]
-            result = subprocess.run(
-                cmd,
-                capture_output=True,
-                text=True,
-                timeout=8
-            )
-            if result.returncode == 0:
-                title = result.stdout.strip()
-                if title:
-                    self.title_fetched.emit(title)
+            import yt_dlp
+            ydl_opts = {
+                'simulate': True,
+                'quiet': True,
+                'skip_download': True,
+                'extract_flat': False,
+            }
+            with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+                info = ydl.extract_info(self.url, download=False)
+                res = {
+                    "title": info.get("title", "Unnamed Stream"),
+                    "is_live": bool(info.get("is_live")),
+                }
+                self.metadata_fetched.emit(res)
         except Exception as e:
-            print(f"Error fetching title: {e}")
+            self.error_occurred.emit(str(e))
 
 class StreamDialog(QDialog):
     """Configuration dialog for adding and editing live streams and local video files."""
@@ -1109,16 +1215,30 @@ class StreamDialog(QDialog):
             self.fetcher_thread.terminate()
             self.fetcher_thread.wait()
             
-        self.lbl_detect_status.setText("Detecting title...")
-        self.fetcher_thread = TitleFetcher(url)
-        self.fetcher_thread.title_fetched.connect(self.on_title_fetched)
-        self.fetcher_thread.finished.connect(lambda: self.lbl_detect_status.setText(""))
+        self.lbl_detect_status.setText("Detecting source...")
+        self.lbl_detect_status.setStyleSheet("color: #00b4d8; font-size: 11px; font-weight: normal;")
+        self.fetcher_thread = MetadataFetcher(url)
+        self.fetcher_thread.metadata_fetched.connect(self.on_metadata_fetched)
+        self.fetcher_thread.error_occurred.connect(self.on_metadata_error)
+        self.fetcher_thread.finished.connect(self.on_fetch_finished)
         self.fetcher_thread.start()
         
-    def on_title_fetched(self, title):
+    def on_metadata_fetched(self, metadata):
         current_name = self.txt_name.text().strip()
         if not current_name or current_name == "Unnamed Stream":
-            self.txt_name.setText(title)
+            self.txt_name.setText(metadata["title"])
+        self.stream["is_live"] = metadata["is_live"]
+        type_str = "Live Stream" if metadata["is_live"] else "VOD/Video"
+        self.lbl_detect_status.setText(f"Detected: {type_str}")
+        self.lbl_detect_status.setStyleSheet("color: #4ade80; font-size: 11px; font-weight: bold;")
+        
+    def on_metadata_error(self, err):
+        self.lbl_detect_status.setText("Detection failed")
+        self.lbl_detect_status.setStyleSheet("color: #ef233c; font-size: 11px; font-weight: bold;")
+        
+    def on_fetch_finished(self):
+        if "Detected" not in self.lbl_detect_status.text() and "failed" not in self.lbl_detect_status.text():
+            self.lbl_detect_status.setText("")
             
     def validate_and_accept(self):
         name = self.txt_name.text().strip()
@@ -1134,6 +1254,8 @@ class StreamDialog(QDialog):
         self.stream["url"] = url
         self.stream["favorite"] = self.chk_fav.isChecked()
         self.stream["is_local"] = (self.combo_type.currentData() == "local")
+        if "is_live" not in self.stream:
+            self.stream["is_live"] = False
         self.accept()
         
     def closeEvent(self, event):
@@ -1141,6 +1263,83 @@ class StreamDialog(QDialog):
             self.fetcher_thread.terminate()
             self.fetcher_thread.wait()
         event.accept()
+
+
+class DownloadThread(QThread):
+    progress = pyqtSignal(str)
+    finished = pyqtSignal(bool, str) # success, message or final path
+    
+    def __init__(self, url, duration, output_dir, is_live):
+        super().__init__()
+        self.url = url
+        self.duration = duration
+        self.output_dir = output_dir
+        self.is_live = is_live
+        
+    def run(self):
+        try:
+            import hashlib
+            url_hash = hashlib.md5(self.url.encode('utf-8')).hexdigest()
+            os.makedirs(self.output_dir, exist_ok=True)
+            final_path = os.path.join(self.output_dir, f"{url_hash}.mp4")
+            
+            if os.path.exists(final_path):
+                try:
+                    os.remove(final_path)
+                except Exception:
+                    pass
+            
+            self.progress.emit("Starting download...")
+            
+            if self.duration != 'whole':
+                cmd = [
+                    "yt-dlp",
+                    "--downloader", "ffmpeg",
+                    "--downloader-args", f"ffmpeg:-t {self.duration}",
+                    "-f", "bestvideo[ext=mp4]+bestaudio[ext=m4a]/best[ext=mp4]/best",
+                    "--merge-output-format", "mp4",
+                    "-o", final_path,
+                    self.url
+                ]
+            else:
+                cmd = [
+                    "yt-dlp",
+                    "-f", "bestvideo[ext=mp4]+bestaudio[ext=m4a]/best[ext=mp4]/best",
+                    "--merge-output-format", "mp4",
+                    "-o", final_path,
+                    self.url
+                ]
+                
+            process = subprocess.Popen(
+                cmd,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.STDOUT,
+                text=True,
+                bufsize=1,
+                universal_newlines=True
+            )
+            
+            for line in process.stdout:
+                line = line.strip()
+                if not line:
+                    continue
+                if "[download]" in line and "%" in line:
+                    parts = line.split()
+                    for p in parts:
+                        if "%" in p:
+                            self.progress.emit(f"Downloading: {p}")
+                            break
+                elif "ffmpeg" in line.lower() or "downloading" in line.lower():
+                    self.progress.emit(line)
+                    
+            process.wait()
+            
+            if process.returncode == 0 and os.path.exists(final_path):
+                self.finished.emit(True, final_path)
+            else:
+                self.finished.emit(False, "yt-dlp exited with non-zero code or output file missing.")
+        except Exception as e:
+            self.finished.emit(False, str(e))
 
 
 # ==============================================================================
@@ -1202,6 +1401,7 @@ class MainWindow(QMainWindow):
         
         # Stream List Widget
         self.lst_streams = QListWidget()
+        self.lst_streams.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
         self.lst_streams.itemSelectionChanged.connect(self.on_stream_selection_changed)
         sidebar_layout.addWidget(self.lst_streams)
         
@@ -1226,11 +1426,14 @@ class MainWindow(QMainWindow):
         sidebar_layout.addLayout(crud_layout)
         
         # ----------------------------------------------------------------------
-        # Main Right Panel
+        # Main Right Panel (QTabWidget)
         # ----------------------------------------------------------------------
-        main_panel = QFrame()
-        main_panel.setObjectName("main-panel")
-        main_panel_layout = QVBoxLayout(main_panel)
+        self.right_tabs = QTabWidget()
+        self.right_tabs.setObjectName("right-tabs")
+        
+        # --- TAB 1: Wallpaper Dashboard ---
+        dashboard_tab = QWidget()
+        main_panel_layout = QVBoxLayout(dashboard_tab)
         main_panel_layout.setContentsMargins(20, 20, 20, 20)
         main_panel_layout.setSpacing(16)
         
@@ -1283,6 +1486,77 @@ class MainWindow(QMainWindow):
         preview_ctrls.addStretch()
         
         main_panel_layout.addLayout(preview_ctrls)
+        
+        # ----------------------------------------------------------------------
+        # Download Panel / Frame
+        # ----------------------------------------------------------------------
+        self.download_frame = QFrame()
+        self.download_frame.setObjectName("download-frame")
+        self.download_frame.setStyleSheet("""
+            QFrame#download-frame {
+                background-color: #1a1a1e;
+                border: 1px solid #28282f;
+                border-radius: 8px;
+                padding: 12px;
+            }
+        """)
+        download_layout = QVBoxLayout(self.download_frame)
+        download_layout.setSpacing(10)
+        
+        lbl_download_header = QLabel("Local Video Downloader (yt-dlp)")
+        lbl_download_header.setStyleSheet("font-weight: bold; color: #e2e2e9; font-size: 13px;")
+        download_layout.addWidget(lbl_download_header)
+        
+        # Duration selection row
+        duration_row = QHBoxLayout()
+        duration_row.setSpacing(10)
+        
+        lbl_dur = QLabel("Download Duration:")
+        lbl_dur.setStyleSheet("font-weight: 500; color: #a0a0ab;")
+        duration_row.addWidget(lbl_dur)
+        
+        self.combo_duration = QComboBox()
+        self.combo_duration.addItem("30 Seconds", 30)
+        self.combo_duration.addItem("60 Seconds", 60)
+        self.combo_duration.addItem("120 Seconds", 120)
+        self.combo_duration.addItem("Whole Video", "whole")
+        duration_row.addWidget(self.combo_duration)
+        
+        self.btn_download = QPushButton("Download Local Loop")
+        self.btn_download.clicked.connect(self.start_download)
+        duration_row.addWidget(self.btn_download)
+        
+        duration_row.addStretch()
+        download_layout.addLayout(duration_row)
+        
+        # Download status/progress label
+        self.lbl_download_status = QLabel("No local download found.")
+        self.lbl_download_status.setStyleSheet("color: #7a7a85; font-size: 12px;")
+        download_layout.addWidget(self.lbl_download_status)
+        
+        # Playback Mode Toggle Row
+        toggle_row = QHBoxLayout()
+        toggle_row.setSpacing(15)
+        
+        lbl_mode = QLabel("Playback Mode:")
+        lbl_mode.setStyleSheet("font-weight: 500; color: #a0a0ab;")
+        toggle_row.addWidget(lbl_mode)
+        
+        self.radio_run_live = QRadioButton("Run Live Stream (URL)")
+        self.radio_run_live.setStyleSheet("color: #e2e2e9; font-weight: bold;")
+        self.radio_run_live.toggled.connect(self.on_playback_mode_toggled)
+        toggle_row.addWidget(self.radio_run_live)
+        
+        self.radio_run_local = QRadioButton("Run Local Loop")
+        self.radio_run_local.setStyleSheet("color: #e2e2e9; font-weight: bold;")
+        self.radio_run_local.toggled.connect(self.on_playback_mode_toggled)
+        toggle_row.addWidget(self.radio_run_local)
+        
+        toggle_row.addStretch()
+        download_layout.addLayout(toggle_row)
+        
+        main_panel_layout.addWidget(self.download_frame)
+        self.download_frame.setVisible(False)
         
         # Horizontal Divider
         divider = QFrame()
@@ -1351,9 +1625,70 @@ class MainWindow(QMainWindow):
         
         main_panel_layout.addLayout(action_layout)
         
+        self.right_tabs.addTab(dashboard_tab, "Wallpaper Dashboard")
+        
+        # --- TAB 2: Help & Compatibility ---
+        help_tab = QWidget()
+        help_layout = QVBoxLayout(help_tab)
+        help_layout.setContentsMargins(24, 24, 24, 24)
+        help_layout.setSpacing(16)
+        help_layout.setAlignment(Qt.AlignmentFlag.AlignTop)
+        
+        lbl_help_title = QLabel("Help & Compatibility")
+        lbl_help_title.setStyleSheet("font-size: 18px; font-weight: 800; color: #00b4d8;")
+        help_layout.addWidget(lbl_help_title)
+        
+        # Compatibility banner
+        banner = QFrame()
+        banner.setStyleSheet("""
+            QFrame {
+                background-color: #1a1a1e;
+                border: 1px solid #00b4d8;
+                border-radius: 8px;
+                padding: 16px;
+            }
+        """)
+        banner_layout = QVBoxLayout(banner)
+        banner_layout.setSpacing(8)
+        
+        lbl_banner_title = QLabel("ℹ  Protocol & URL Compatibility Information")
+        lbl_banner_title.setStyleSheet("font-weight: bold; color: #00b4d8; font-size: 14px;")
+        banner_layout.addWidget(lbl_banner_title)
+        
+        lbl_banner_desc = QLabel(
+            "This application utilizes the powerful <b>yt-dlp</b> engine as its backend to stream "
+            "and download video content. This guarantees native compatibility with a vast range "
+            "of media protocols and hosting platforms."
+        )
+        lbl_banner_desc.setWordWrap(True)
+        lbl_banner_desc.setTextFormat(Qt.TextFormat.RichText)
+        banner_layout.addWidget(lbl_banner_desc)
+        
+        help_layout.addWidget(banner)
+        
+        # Details list
+        lbl_details = QLabel(
+            "<h3>Supported Input Protocols & Platforms:</h3>"
+            "<ul>"
+            "<li><b>YouTube:</b> Live streams, videos, playlists.</li>"
+            "<li><b>Twitch:</b> Live channels and broadcast VODs.</li>"
+            "<li><b>Vimeo:</b> Standard videos and live broadcasts.</li>"
+            "<li><b>IPTV / Custom Streams:</b> Direct HLS (<code>.m3u8</code>), RTMP, RTSP, or custom feeds.</li>"
+            "<li><b>Direct Web Links:</b> Direct URLs pointing to video files (<code>.mp4</code>, <code>.mkv</code>, <code>.webm</code>, etc.).</li>"
+            "</ul>"
+            "<p>Any streaming source compatible with the <b>yt-dlp</b> CLI is natively supported "
+            "and can be added directly to your wallpaper library.</p>"
+        )
+        lbl_details.setWordWrap(True)
+        lbl_details.setTextFormat(Qt.TextFormat.RichText)
+        lbl_details.setStyleSheet("color: #e2e2e9; line-height: 1.4;")
+        help_layout.addWidget(lbl_details)
+        
+        self.right_tabs.addTab(help_tab, "Help & Compatibility")
+        
         # Add sidebars to splitter
         splitter.addWidget(sidebar)
-        splitter.addWidget(main_panel)
+        splitter.addWidget(self.right_tabs)
         splitter.setSizes([320, 630])
         
         # Status Bar
@@ -1505,9 +1840,116 @@ class MainWindow(QMainWindow):
         self.btn_edit.setEnabled(has_selection)
         self.btn_delete.setEnabled(has_selection)
         
+        if not has_selection:
+            self.download_frame.setVisible(False)
+            return
+            
+        stream = current_item.data(Qt.ItemDataRole.UserRole)
+        
+        if stream.get("is_local", False):
+            self.download_frame.setVisible(False)
+        else:
+            self.download_frame.setVisible(True)
+            
+            # Enable/disable 'Whole Video' if stream is live
+            is_live = stream.get("is_live", False)
+            item = self.combo_duration.model().item(3)
+            if item:
+                item.setEnabled(not is_live)
+            if is_live and self.combo_duration.currentIndex() == 3:
+                self.combo_duration.setCurrentIndex(0)
+                
+            # Check if local downloaded file exists
+            import hashlib
+            url_hash = hashlib.md5(stream["url"].encode('utf-8')).hexdigest()
+            local_dir = os.path.join(Path.home(), ".local", "share", "wallpaper-motor", "videos")
+            local_file = os.path.join(local_dir, f"{url_hash}.mp4")
+            
+            local_exists = os.path.exists(local_file)
+            self.radio_run_local.setEnabled(local_exists)
+            
+            current_mode = stream.get("playback_mode", "live")
+            if current_mode == "local" and not local_exists:
+                current_mode = "live"
+                stream["playback_mode"] = "live"
+                self.db.save_streams()
+                
+            self.radio_run_live.blockSignals(True)
+            self.radio_run_local.blockSignals(True)
+            if current_mode == "local":
+                self.radio_run_local.setChecked(True)
+            else:
+                self.radio_run_live.setChecked(True)
+            self.radio_run_live.blockSignals(False)
+            self.radio_run_local.blockSignals(False)
+            
+            if local_exists:
+                size_mb = os.path.getsize(local_file) / (1024 * 1024)
+                self.lbl_download_status.setText(f"Local copy exists ({size_mb:.1f} MB). Ready to loop.")
+                self.lbl_download_status.setStyleSheet("color: #4ade80; font-size: 12px;")
+            else:
+                self.lbl_download_status.setText("No local copy downloaded yet.")
+                self.lbl_download_status.setStyleSheet("color: #7a7a85; font-size: 12px;")
+        
         # Seamlessly update preview on selection swap if it's already active
         if has_selection and self.preview_stack.currentIndex() == 1:
             self.play_selected_preview()
+            
+    def start_download(self):
+        current_item = self.lst_streams.currentItem()
+        if not current_item:
+            return
+        stream = current_item.data(Qt.ItemDataRole.UserRole)
+        
+        self.btn_download.setEnabled(False)
+        self.combo_duration.setEnabled(False)
+        self.lbl_download_status.setText("Preparing download...")
+        self.lbl_download_status.setStyleSheet("color: #00b4d8; font-size: 12px;")
+        
+        url = stream["url"]
+        duration = self.combo_duration.currentData()
+        local_dir = os.path.join(Path.home(), ".local", "share", "wallpaper-motor", "videos")
+        is_live = stream.get("is_live", False)
+        
+        self.dl_thread = DownloadThread(url, duration, local_dir, is_live)
+        self.dl_thread.progress.connect(self.on_download_progress)
+        self.dl_thread.finished.connect(self.on_download_finished)
+        self.dl_thread.start()
+        
+    def on_download_progress(self, msg):
+        self.lbl_download_status.setText(msg)
+        
+    def on_download_finished(self, success, result):
+        self.btn_download.setEnabled(True)
+        self.combo_duration.setEnabled(True)
+        
+        current_item = self.lst_streams.currentItem()
+        if not current_item:
+            return
+        stream = current_item.data(Qt.ItemDataRole.UserRole)
+        
+        if success:
+            size_mb = os.path.getsize(result) / (1024 * 1024)
+            self.lbl_download_status.setText(f"Download complete! ({size_mb:.1f} MB). Ready to loop.")
+            self.lbl_download_status.setStyleSheet("color: #4ade80; font-size: 12px;")
+            self.radio_run_local.setEnabled(True)
+            self.radio_run_local.setChecked(True)
+        else:
+            self.lbl_download_status.setText(f"Download failed: {result}")
+            self.lbl_download_status.setStyleSheet("color: #ef233c; font-size: 12px;")
+            
+    def on_playback_mode_toggled(self):
+        current_item = self.lst_streams.currentItem()
+        if not current_item:
+            return
+        stream = current_item.data(Qt.ItemDataRole.UserRole)
+        
+        mode = "local" if self.radio_run_local.isChecked() else "live"
+        stream["playback_mode"] = mode
+        self.db.save_streams()
+        
+        # Stop preview or wallpaper if they are active to allow applying new mode
+        self.stop_selected_preview()
             
     def filter_streams(self):
         query = self.txt_search.text().lower().strip()
@@ -1637,6 +2079,14 @@ class MainWindow(QMainWindow):
         if not url:
             return
             
+        if not stream.get("is_local", False) and stream.get("playback_mode", "live") == "local":
+            import hashlib
+            url_hash = hashlib.md5(url.encode('utf-8')).hexdigest()
+            local_dir = os.path.join(Path.home(), ".local", "share", "wallpaper-motor", "videos")
+            local_file = os.path.join(local_dir, f"{url_hash}.mp4")
+            if os.path.exists(local_file):
+                url = local_file
+                
         self.preview_stack.setCurrentIndex(1)
         self.lbl_prev_status.setText("Preview Status: Buffering/Playing...")
         
@@ -1659,6 +2109,14 @@ class MainWindow(QMainWindow):
         if not url:
             return
             
+        if not stream.get("is_local", False) and stream.get("playback_mode", "live") == "local":
+            import hashlib
+            url_hash = hashlib.md5(url.encode('utf-8')).hexdigest()
+            local_dir = os.path.join(Path.home(), ".local", "share", "wallpaper-motor", "videos")
+            local_file = os.path.join(local_dir, f"{url_hash}.mp4")
+            if os.path.exists(local_file):
+                url = local_file
+                
         resolution = self.get_selected_resolution()
         if not resolution:
             QMessageBox.warning(self, "Invalid Geometry", "Please specify a valid screen geometry.")
@@ -1937,6 +2395,35 @@ class MainWindow(QMainWindow):
             color: #7a7a85;
             font-size: 11px;
         }
+
+        QTabWidget::pane {
+            border: 1px solid #28282f;
+            background-color: #121214;
+            border-top: none;
+        }
+
+        QTabBar::tab {
+            background-color: #1a1a1e;
+            color: #8a8a98;
+            border: 1px solid #28282f;
+            border-bottom: none;
+            border-top-left-radius: 6px;
+            border-top-right-radius: 6px;
+            padding: 8px 16px;
+            font-weight: bold;
+            font-size: 12px;
+        }
+
+        QTabBar::tab:selected {
+            background-color: #121214;
+            color: #00b4d8;
+            border-bottom: 2px solid #00b4d8;
+        }
+
+        QTabBar::tab:hover {
+            background-color: #23232a;
+            color: #e2e2e9;
+        }
         """
 
 # ==============================================================================
@@ -1958,6 +2445,13 @@ if __name__ == "__main__":
     # Handle X11 integration and PyQt initialization
     app = QApplication(sys.argv)
     app.setQuitOnLastWindowClosed(False)
+
+    # Wayland Safety Detector
+    session_type = os.environ.get("XDG_SESSION_TYPE", "")
+    if session_type.lower() == "wayland":
+        dlg = WaylandErrorDialog()
+        dlg.exec()
+        sys.exit(0)
 
     # Initialize Main GUI
     main_win = MainWindow()
