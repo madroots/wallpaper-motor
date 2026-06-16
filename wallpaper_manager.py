@@ -311,8 +311,17 @@ class DatabaseManager:
     def __init__(self):
         self.config_dir = Path.home() / ".config" / "stream-wallpaper-manager"
         self.config_file = self.config_dir / "streams.json"
+        self.settings_file = self.config_dir / "settings.json"
         self.streams = []
+        self.settings = {
+            "autostart": False,
+            "auto_restore": False,
+            "last_wallpaper_url": "",
+            "last_wallpaper_resolution": "",
+            "last_wallpaper_name": ""
+        }
         self.load_streams()
+        self.load_settings()
         
     def load_streams(self):
         if not self.config_dir.exists():
@@ -335,6 +344,25 @@ class DatabaseManager:
                 json.dump(self.streams, f, indent=4)
         except Exception as e:
             print(f"Error saving stream database: {e}")
+
+    def load_settings(self):
+        if not self.settings_file.exists():
+            self.save_settings()
+        else:
+            try:
+                with open(self.settings_file, "r") as f:
+                    loaded = json.load(f)
+                    for k, v in loaded.items():
+                        self.settings[k] = v
+            except Exception as e:
+                print(f"Error loading settings: {e}")
+                
+    def save_settings(self):
+        try:
+            with open(self.settings_file, "w") as f:
+                json.dump(self.settings, f, indent=4)
+        except Exception as e:
+            print(f"Error saving settings: {e}")
 
 
 # ==============================================================================
@@ -2589,6 +2617,69 @@ class MainWindow(QMainWindow):
         
         self.right_tabs.addTab(help_tab, "About & Help")
         
+        # --- TAB 3: Settings ---
+        settings_tab = QWidget()
+        settings_layout = QVBoxLayout(settings_tab)
+        settings_layout.setContentsMargins(24, 24, 24, 24)
+        settings_layout.setSpacing(16)
+        settings_layout.setAlignment(Qt.AlignmentFlag.AlignTop)
+        
+        lbl_settings_title = QLabel("System Settings")
+        lbl_settings_title.setStyleSheet("font-size: 18px; font-weight: 800; color: #00b4d8;")
+        settings_layout.addWidget(lbl_settings_title)
+        
+        settings_frame = QFrame()
+        settings_frame.setStyleSheet("""
+            QFrame {
+                background-color: #1a1c23;
+                border: 1px solid #2a2d38;
+                border-radius: 8px;
+                padding: 20px;
+            }
+            QCheckBox {
+                color: #e2e2e9;
+                font-size: 13px;
+                font-weight: 600;
+                spacing: 8px;
+                background: transparent;
+                border: none;
+            }
+        """)
+        frame_layout = QVBoxLayout(settings_frame)
+        frame_layout.setSpacing(20)
+        
+        # Startup option block
+        startup_block = QVBoxLayout()
+        startup_block.setSpacing(4)
+        self.chk_startup = QCheckBox("Launch Wallpaper Motor on system startup")
+        self.chk_startup.setChecked(self.db.settings.get("autostart", False))
+        self.chk_startup.toggled.connect(self.on_startup_toggled)
+        
+        lbl_startup_desc = QLabel("Starts the application minimized in the system tray when logging in to your desktop.")
+        lbl_startup_desc.setStyleSheet("color: #718096; font-size: 11px; margin-left: 28px; background: transparent; border: none;")
+        
+        startup_block.addWidget(self.chk_startup)
+        startup_block.addWidget(lbl_startup_desc)
+        frame_layout.addLayout(startup_block)
+        
+        # Restore option block
+        restore_block = QVBoxLayout()
+        restore_block.setSpacing(4)
+        self.chk_restore = QCheckBox("Automatically restore last active wallpaper on launch")
+        self.chk_restore.setChecked(self.db.settings.get("auto_restore", False))
+        self.chk_restore.toggled.connect(self.on_restore_toggled)
+        
+        lbl_restore_desc = QLabel("Resumes playback of the last active wallpaper on the target monitor as soon as the app starts.")
+        lbl_restore_desc.setStyleSheet("color: #718096; font-size: 11px; margin-left: 28px; background: transparent; border: none;")
+        
+        restore_block.addWidget(self.chk_restore)
+        restore_block.addWidget(lbl_restore_desc)
+        frame_layout.addLayout(restore_block)
+        
+        settings_layout.addWidget(settings_frame)
+        
+        self.right_tabs.addTab(settings_tab, "Settings")
+        
         # Add sidebars to splitter
         splitter.addWidget(sidebar)
         splitter.addWidget(self.right_tabs)
@@ -2627,6 +2718,23 @@ class MainWindow(QMainWindow):
                 "PrepareForSleep",
                 self.handle_prepare_for_sleep
             )
+        
+        # Ensure autostart state matches setting (self-healing desktop file)
+        if self.db.settings.get("autostart", False):
+            self.set_autostart(True)
+
+        # Auto-restore last wallpaper if enabled
+        if self.db.settings.get("auto_restore", False):
+            url = self.db.settings.get("last_wallpaper_url", "")
+            resolution = self.db.settings.get("last_wallpaper_resolution", "")
+            name = self.db.settings.get("last_wallpaper_name", "")
+            if url and resolution:
+                self.active_url = url
+                self.active_wallpaper_name = name if name else "Live Wallpaper"
+                self.proc_manager.start_wallpaper(url, resolution)
+                self.status_bar.showMessage(f"Restored last wallpaper: {self.active_wallpaper_name}", 5000)
+                self.refresh_stream_item_active_states()
+                self.update_ui_state()
         
     # ----------------------------------------------------------------------
     # System Tray Integration
@@ -2805,6 +2913,49 @@ class MainWindow(QMainWindow):
             match = not query or query in name or query in category
             item.setHidden(not match)
             
+    def on_startup_toggled(self):
+        checked = self.chk_startup.isChecked()
+        self.db.settings["autostart"] = checked
+        self.db.save_settings()
+        self.set_autostart(checked)
+        
+        if checked:
+            self.chk_restore.setChecked(True)
+
+    def on_restore_toggled(self):
+        checked = self.chk_restore.isChecked()
+        self.db.settings["auto_restore"] = checked
+        self.db.save_settings()
+
+    def set_autostart(self, enabled: bool):
+        autostart_dir = Path.home() / ".config" / "autostart"
+        desktop_file = autostart_dir / "wallpapermotor.desktop"
+        
+        if enabled:
+            try:
+                autostart_dir.mkdir(parents=True, exist_ok=True)
+                exec_cmd = f'"{sys.executable}" "{os.path.abspath(sys.argv[0])}" --minimized'
+                desktop_content = f"""[Desktop Entry]
+Type=Application
+Name=Wallpaper Motor
+Comment=Launch Wallpaper Motor in background
+Exec={exec_cmd}
+Icon=wallpaper-motor
+X-GNOME-Autostart-enabled=true
+Terminal=false
+"""
+                with open(desktop_file, "w") as f:
+                    f.write(desktop_content)
+                desktop_file.chmod(0o755)  # Make it executable
+            except Exception as e:
+                print(f"Error creating autostart entry: {e}")
+        else:
+            try:
+                if desktop_file.exists():
+                    desktop_file.unlink()
+            except Exception as e:
+                print(f"Error removing autostart entry: {e}")
+
     def get_existing_categories(self):
         categories = set()
         for stream in self.db.streams:
@@ -3005,10 +3156,23 @@ class MainWindow(QMainWindow):
         self.refresh_stream_item_active_states()
         self.status_bar.showMessage("Wallpaper deployed successfully.", 4000)
         
+        # Save active wallpaper state
+        self.db.settings["last_wallpaper_url"] = url
+        self.db.settings["last_wallpaper_resolution"] = resolution
+        self.db.settings["last_wallpaper_name"] = stream.get("name", "")
+        self.db.save_settings()
+        
     def stop_wallpaper(self):
         self.proc_manager.stop_wallpaper()
         self.active_wallpaper_name = None
         self.active_url = None
+        
+        # Clear active wallpaper state
+        self.db.settings["last_wallpaper_url"] = ""
+        self.db.settings["last_wallpaper_resolution"] = ""
+        self.db.settings["last_wallpaper_name"] = ""
+        self.db.save_settings()
+        
         self.update_ui_state()
         self.refresh_stream_item_active_states()
         self.status_bar.showMessage("Wallpaper playback stopped.", 4000)
@@ -3514,7 +3678,17 @@ if __name__ == "__main__":
                 f"⚠  Missing: {names} — restart after installing.", 0
             )
 
-    # Show window
-    main_win.show()
+    # Show window unless started in background/minimized
+    if "--minimized" not in sys.argv and "--background" not in sys.argv:
+        main_win.show()
+    else:
+        # Started in background/minimized, show a quiet tray message
+        if main_win.tray_icon.isVisible():
+            main_win.tray_icon.showMessage(
+                "Wallpaper Motor",
+                "Started in background.",
+                QSystemTrayIcon.MessageIcon.Information,
+                2000
+            )
 
     sys.exit(app.exec())
