@@ -153,19 +153,33 @@ class ElidedLabel(QLabel):
         self.full_text = text
         self.setToolTip(text)
         super().setText(text)
-        self.update_elided_text()
         
-    def resizeEvent(self, event):
-        super().resizeEvent(event)
-        self.update_elided_text()
+    def minimumSizeHint(self):
+        hint = super().minimumSizeHint()
+        hint.setWidth(10)
+        return hint
+
+    def sizeHint(self):
+        hint = super().sizeHint()
+        hint.setWidth(80)  # prevent size-hint inflation from pushing list elements off-screen
+        return hint
+
+    def paintEvent(self, event):
+        painter = QPainter(self)
+        fm = self.fontMetrics()
+        rect = self.contentsRect()
         
-    def update_elided_text(self):
-        fm = QFontMetrics(self.font())
-        width = self.width() - 4
-        if width <= 0:
-            return
-        elided = fm.elidedText(self.full_text, Qt.TextElideMode.ElideRight, width)
-        super().setText(elided)
+        # Apply padding/safety margin
+        rect.adjust(0, 0, -4, 0)
+        
+        elided = fm.elidedText(self.full_text, Qt.TextElideMode.ElideRight, rect.width())
+        
+        painter.setPen(self.palette().color(self.foregroundRole()))
+        painter.setFont(self.font())
+        
+        align = self.alignment()
+        painter.drawText(rect, align, elided)
+        painter.end()
 
 # ==============================================================================
 # Dynamic Icon Generation (with $APPDIR-aware path resolution)
@@ -333,7 +347,67 @@ class ProcessManager:
         self.preview_process = None
         self.wallpaper_process = None
         self.is_paused = False
+        # Clean up any lingering players from crashed/previous runs on startup
+        self.kill_all_lingering_players(kill_previews=True)
         
+    def kill_all_lingering_players(self, kill_previews=True):
+        """Scans /proc to find and terminate any running xwinwrap or mpv processes matching our signatures."""
+        import os
+        import signal
+        import time
+        
+        my_pid = os.getpid()
+        preview_pid = self.preview_process.pid if self.preview_process else None
+        killed_pids = []
+        
+        try:
+            # First pass: SIGTERM
+            for pid_dir in os.listdir("/proc"):
+                if not pid_dir.isdigit():
+                    continue
+                pid = int(pid_dir)
+                if pid == my_pid:
+                    continue
+                if not kill_previews and pid == preview_pid:
+                    continue
+                    
+                try:
+                    cmdline_path = f"/proc/{pid}/cmdline"
+                    if not os.path.exists(cmdline_path):
+                        continue
+                        
+                    with open(cmdline_path, "r", errors="ignore") as f:
+                        cmdline_parts = f.read().split("\x00")
+                    cmdline_parts = [p for p in cmdline_parts if p]
+                    if not cmdline_parts:
+                        continue
+                        
+                    exe = cmdline_parts[0].lower()
+                    is_our_xwinwrap = ("xwinwrap" in exe and "-ov" in cmdline_parts)
+                    is_our_mpv = ("mpv" in exe and "--no-osc" in cmdline_parts and "--osd-level=0" in cmdline_parts)
+                    
+                    if is_our_xwinwrap or (is_our_mpv and kill_previews):
+                        print(f"Terminating lingering process {pid}: {' '.join(cmdline_parts)}")
+                        try:
+                            os.kill(pid, signal.SIGTERM)
+                            killed_pids.append(pid)
+                        except Exception:
+                            pass
+                except Exception:
+                    pass
+                    
+            if killed_pids:
+                # Give processes a moment to exit
+                time.sleep(0.1)
+                # Second pass: SIGKILL for survivors
+                for pid in killed_pids:
+                    try:
+                        os.kill(pid, signal.SIGKILL)
+                    except Exception:
+                        pass
+        except Exception as e:
+            print(f"Error while scanning and cleaning lingering processes: {e}")
+
     def start_preview(self, url, win_id):
         """Starts a small embedded mpv preview window inside the QWidget."""
         self.stop_preview()
@@ -407,7 +481,9 @@ class ProcessManager:
         if self.wallpaper_process:
             self.terminate_process_group(self.wallpaper_process)
             self.wallpaper_process = None
-            self.is_paused = False
+        self.is_paused = False
+        # Make absolutely sure all lingering wallpaper processes are terminated, but preserve active preview
+        self.kill_all_lingering_players(kill_previews=False)
             
     def pause_wallpaper(self):
         """Sends SIGSTOP to pause playback of the wallpaper process group (saving CPU)."""
@@ -466,6 +542,7 @@ class ProcessManager:
         """Kills all processes launched by the application (prevents zombie processes)."""
         self.stop_preview()
         self.stop_wallpaper()
+        self.kill_all_lingering_players(kill_previews=True)
 
 
 # ==============================================================================
@@ -940,19 +1017,19 @@ class StreamItemWidget(QWidget):
         info_layout.setSpacing(4)
         
         self.lbl_name = ElidedLabel(self.stream.get("name", "Unnamed Stream"))
-        self.lbl_name.setStyleSheet("font-weight: bold; font-size: 13px; color: #e2e2e9;")
+        self.lbl_name.setStyleSheet("font-weight: 600; font-size: 13px; color: #f8f9fa;")
         self.lbl_name.setMinimumWidth(10)
         self.lbl_name.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Preferred)
         
         self.lbl_category = QLabel(self.stream.get("category", "General").upper())
         self.lbl_category.setStyleSheet("""
             font-size: 9px;
-            font-weight: 800;
-            color: #8a8a98;
-            background-color: #24242d;
-            border: 1px solid #34343d;
-            border-radius: 4px;
-            padding: 1px 6px;
+            font-weight: 700;
+            color: #4a5568;
+            background-color: #1a1c23;
+            border: none;
+            border-radius: 3px;
+            padding: 1px 5px;
         """)
         self.lbl_category.setSizePolicy(
             QSizePolicy.Policy.Fixed,
@@ -1254,8 +1331,12 @@ class StreamDialog(QDialog):
         self.stream["url"] = url
         self.stream["favorite"] = self.chk_fav.isChecked()
         self.stream["is_local"] = (self.combo_type.currentData() == "local")
-        if "is_live" not in self.stream:
+        if self.stream["is_local"]:
             self.stream["is_live"] = False
+        else:
+            url_lower = url.lower()
+            is_probably_live = any(k in url_lower for k in ["m3u8", "rtmp", "rtsp", "/live", "twitch.tv", "live/"])
+            self.stream["is_live"] = self.stream.get("is_live", False) or is_probably_live
         self.accept()
         
     def closeEvent(self, event):
@@ -1677,6 +1758,537 @@ class DownloadDialog(QDialog):
 # ==============================================================================
 # UI Component: Main Application Window
 # ==============================================================================
+# ==============================================================================
+# Thumbnail Fetcher — async background worker
+# ==============================================================================
+
+class ThumbnailFetcher(QThread):
+    """Fetches a thumbnail for a stream URL using yt-dlp and caches it to disk."""
+    thumbnail_ready = pyqtSignal(str, str)   # url, local_path
+    failed         = pyqtSignal(str)         # url
+
+    CACHE_DIR = Path.home() / ".cache" / "wallpaper-motor" / "thumbs"
+
+    def __init__(self, url: str, is_local: bool = False):
+        super().__init__()
+        self.url = url
+        self.is_local = is_local
+
+    @staticmethod
+    def cache_path(url: str) -> Path:
+        import hashlib
+        key = hashlib.md5(url.encode()).hexdigest()
+        ThumbnailFetcher.CACHE_DIR.mkdir(parents=True, exist_ok=True)
+        return ThumbnailFetcher.CACHE_DIR / f"{key}.jpg"
+
+    def _generate_live_placeholder(self, dest: Path):
+        from PyQt6.QtGui import QImage, QPainter, QLinearGradient, QColor, QPen, QBrush
+        # Create a thread-safe 256x256 image
+        img = QImage(256, 256, QImage.Format.Format_ARGB32)
+        img.fill(Qt.GlobalColor.transparent)
+
+        painter = QPainter(img)
+        painter.setRenderHint(QPainter.RenderHint.Antialiasing)
+
+        # Draw dark gradient background
+        grad = QLinearGradient(0, 0, 256, 256)
+        grad.setColorAt(0.0, QColor("#121318"))
+        grad.setColorAt(1.0, QColor("#1c1d24"))
+        painter.setBrush(QBrush(grad))
+        painter.setPen(Qt.PenStyle.NoPen)
+        painter.drawRect(0, 0, 256, 256)
+
+        # Draw a centered, modern signal/broadcast icon in cyan
+        cx, cy = 128, 110
+        cyan = QColor("#00b4d8")
+
+        # Center dot
+        painter.setBrush(QBrush(cyan))
+        painter.drawEllipse(cx - 10, cy - 10, 20, 20)
+
+        # Signal arcs
+        painter.setBrush(Qt.BrushStyle.NoBrush)
+        pen = QPen(cyan, 5)
+        pen.setCapStyle(Qt.PenCapStyle.RoundCap)
+        painter.setPen(pen)
+
+        # Inner arcs
+        painter.drawArc(cx - 30, cy - 30, 60, 60, 120 * 16, 120 * 16)
+        painter.drawArc(cx - 30, cy - 30, 60, 60, -60 * 16, 120 * 16)
+
+        # Outer arcs
+        pen.setWidth(7)
+        painter.setPen(pen)
+        painter.drawArc(cx - 56, cy - 56, 112, 112, 130 * 16, 100 * 16)
+        painter.drawArc(cx - 56, cy - 56, 112, 112, -50 * 16, 100 * 16)
+
+        # Red "LIVE" badge at the bottom
+        painter.setPen(Qt.PenStyle.NoPen)
+        painter.setBrush(QBrush(QColor("#ef233c")))
+        badge_w, badge_h = 76, 24
+        painter.drawRoundedRect(cx - badge_w // 2, cy + 68, badge_w, badge_h, 6, 6)
+
+        painter.setPen(QPen(QColor("#ffffff")))
+        font = painter.font()
+        font.setPointSize(11)
+        font.setBold(True)
+        painter.setFont(font)
+        painter.drawText(cx - badge_w // 2, cy + 68, badge_w, badge_h, Qt.AlignmentFlag.AlignCenter, "LIVE")
+
+        painter.end()
+        # Save as JPG to match the cached extension
+        img.save(str(dest), "JPG")
+
+    def run(self):
+        dest = self.cache_path(self.url)
+        if dest.exists():
+            self.thumbnail_ready.emit(self.url, str(dest))
+            return
+
+        # Check if URL looks like a generic live stream (Tier 2 fast path)
+        url_lower = self.url.lower()
+        if any(ext in url_lower for ext in (".m3u8", ".mpd", "rtmp://", "rtsp://", "/live/")):
+            # If not a youtube link specifically, let's treat it as generic live stream fallback
+            import re
+            yt_match = re.search(r'(?:youtube\.com\/(?:[^\/]+\/.+\/|(?:v|e(?:mbed)?|live)\/|.*[?&]v=)|youtu\.be\/)([^"&?\/ ]{11})', self.url)
+            if not yt_match:
+                try:
+                    self._generate_live_placeholder(dest)
+                    if dest.exists():
+                        self.thumbnail_ready.emit(self.url, str(dest))
+                        return
+                except Exception:
+                    pass
+
+        try:
+            # Tier 1: Platform API Matching for YouTube
+            import re
+            yt_match = re.search(r'(?:youtube\.com\/(?:[^\/]+\/.+\/|(?:v|e(?:mbed)?|live)\/|.*[?&]v=)|youtu\.be\/)([^"&?\/ ]{11})', self.url)
+            if yt_match:
+                video_id = yt_match.group(1)
+                thumb_url = f"https://img.youtube.com/vi/{video_id}/mqdefault.jpg"
+                try:
+                    import urllib.request
+                    req = urllib.request.Request(
+                        thumb_url,
+                        headers={'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'}
+                    )
+                    with urllib.request.urlopen(req, timeout=8) as response:
+                        dest.write_bytes(response.read())
+                    if dest.exists():
+                        self.thumbnail_ready.emit(self.url, str(dest))
+                        return
+                except Exception:
+                    pass
+
+            if self.is_local:
+                # Use ffmpeg to grab frame at 10 s (or 0 s for short clips)
+                cmd = [
+                    "ffmpeg", "-y", "-ss", "10", "-i", self.url,
+                    "-vframes", "1", "-q:v", "4",
+                    "-vf", "scale=160:-1",
+                    str(dest)
+                ]
+                r = subprocess.run(cmd, stdout=subprocess.DEVNULL,
+                                   stderr=subprocess.DEVNULL, timeout=20)
+                if r.returncode != 0:
+                    # retry at 0 s
+                    cmd[3] = "0"
+                    subprocess.run(cmd, stdout=subprocess.DEVNULL,
+                                   stderr=subprocess.DEVNULL, timeout=20)
+            else:
+                import yt_dlp
+                ydl_opts = {
+                    'quiet': True,
+                    'skip_download': True,
+                    'extract_flat': False,
+                    'writethumbnail': True,
+                    'outtmpl': str(dest.with_suffix('')),
+                    'postprocessors': [{'key': 'FFmpegThumbnailsConvertor',
+                                        'format': 'jpg'}],
+                }
+                with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+                    ydl.extract_info(self.url, download=False)
+                # yt-dlp names it <hash>.jpg or <hash>.webp → normalise
+                for ext in (".jpg", ".webp", ".png"):
+                    candidate = dest.with_suffix(ext)
+                    if candidate.exists():
+                        if ext != ".jpg":
+                            candidate.rename(dest)
+                        break
+
+            if dest.exists():
+                self.thumbnail_ready.emit(self.url, str(dest))
+            else:
+                raise RuntimeError("No thumbnail generated")
+        except Exception:
+            # Tier 2 Fallback: Generate generic live stream placeholder
+            try:
+                self._generate_live_placeholder(dest)
+                if dest.exists():
+                    self.thumbnail_ready.emit(self.url, str(dest))
+                    return
+            except Exception:
+                pass
+            self.failed.emit(self.url)
+
+
+# ==============================================================================
+# Sidebar Item Widgets — List View (with thumbnail) & Grid View
+# ==============================================================================
+
+class StreamListItemWidget(QWidget):
+    """Detailed-view row: [thumbnail] | [title + category badge] | [★]"""
+
+    THUMB_W, THUMB_H = 56, 38
+
+    def __init__(self, stream: dict, on_favorite_toggled, parent=None):
+        super().__init__(parent)
+        self.stream = stream
+        self.on_favorite_toggled = on_favorite_toggled
+        self._fetcher = None
+        self._build_ui()
+        self._request_thumbnail()
+        self.setToolTip(stream.get("name", ""))
+
+    def sizeHint(self):
+        return QSize(150, 50)
+
+    def update_active_state(self, active_url: str):
+        is_active = (self.stream.get("url") == active_url)
+        if is_active:
+            self.setStyleSheet("""
+                QWidget {
+                    background-color: rgba(0, 180, 216, 0.08);
+                    border-radius: 6px;
+                }
+            """)
+            self.lbl_name.setStyleSheet("""
+                font-weight: 700; 
+                font-size: 12px; 
+                color: #00b4d8; 
+                background: transparent;
+                padding-right: 8px;
+            """)
+        else:
+            self.setStyleSheet("QWidget { background-color: transparent; }")
+            self.lbl_name.setStyleSheet("""
+                font-weight: 600; 
+                font-size: 12px; 
+                color: #f8f9fa; 
+                background: transparent;
+                padding-right: 8px;
+            """)
+
+    def _build_ui(self):
+        layout = QHBoxLayout(self)
+        layout.setContentsMargins(8, 6, 8, 6)
+        layout.setSpacing(10)
+
+        # Thumbnail placeholder
+        self.lbl_thumb = QLabel()
+        self.lbl_thumb.setFixedSize(self.THUMB_W, self.THUMB_H)
+        self.lbl_thumb.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self.lbl_thumb.setStyleSheet(
+            "background: #0c0e13; border-radius: 4px; border: 1px solid #1e2029;"
+        )
+        self._set_placeholder_thumb()
+        layout.addWidget(self.lbl_thumb)
+
+        # Info column
+        info = QVBoxLayout()
+        info.setSpacing(3)
+
+        self.lbl_name = ElidedLabel(self.stream.get("name", "Unnamed"))
+        self.lbl_name.setStyleSheet("""
+            font-weight: 600; 
+            font-size: 12px; 
+            color: #f8f9fa; 
+            background: transparent;
+            padding-right: 8px;
+            /* text-overflow: ellipsis; */
+            /* white-space: nowrap; */
+            /* overflow: hidden; */
+        """)
+        self.lbl_name.setSizePolicy(
+            QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Preferred
+        )
+
+        cat_text = self.stream.get("category", "General").upper()
+        self.lbl_cat = QLabel()
+        
+        # Check if the source is a live stream (either explicitly set, or inferred from remote stream signatures)
+        url_lower = self.stream.get("url", "").lower()
+        is_live = (self.stream.get("is_live", False) or 
+                   (not self.stream.get("is_local", False) and 
+                    any(k in url_lower for k in ["m3u8", "rtmp", "rtsp", "/live", "twitch.tv", "live/"])))
+                    
+        if is_live:
+            self.lbl_cat.setText(f"{cat_text}  •  LIVE")
+            self.lbl_cat.setStyleSheet(
+                "font-size: 9px; font-weight: 800; color: #ef233c;"
+                "background: transparent; padding: 0;"
+            )
+        else:
+            self.lbl_cat.setText(f"{cat_text}  •  VIDEO")
+            self.lbl_cat.setStyleSheet(
+                "font-size: 9px; font-weight: 700; color: #4a5568;"
+                "background: transparent; padding: 0;"
+            )
+        self.lbl_cat.setSizePolicy(QSizePolicy.Policy.Fixed, QSizePolicy.Policy.Fixed)
+
+        info.addWidget(self.lbl_name)
+        info.addWidget(self.lbl_cat)
+        layout.addLayout(info, 1)
+
+        # Star button
+        self.btn_fav = QPushButton()
+        self.btn_fav.setFixedSize(26, 26)
+        self.btn_fav.setFlat(True)
+        self.btn_fav.setStyleSheet(
+            "QPushButton { background: transparent; border: none; }"
+            "QPushButton:hover { background: rgba(255,255,255,0.05); border-radius: 4px; }"
+        )
+        self.btn_fav.setIcon(create_star_icon(self.stream.get("favorite", False)))
+        self.btn_fav.clicked.connect(self._toggle_fav)
+        layout.addWidget(self.btn_fav)
+
+    def _set_placeholder_thumb(self):
+        from PyQt6.QtGui import QPixmap
+        px = QPixmap(self.THUMB_W, self.THUMB_H)
+        px.fill(QColor("#0c0e13"))
+        p = QPainter(px)
+        p.setRenderHint(QPainter.RenderHint.Antialiasing)
+        p.setPen(QPen(QColor("#1e2a35"), 1))
+        p.setBrush(QBrush(QColor("#1e2a35")))
+        tri = QPolygonF([
+            QPointF(self.THUMB_W * 0.38, self.THUMB_H * 0.28),
+            QPointF(self.THUMB_W * 0.38, self.THUMB_H * 0.72),
+            QPointF(self.THUMB_W * 0.68, self.THUMB_H * 0.50),
+        ])
+        p.drawPolygon(tri)
+        p.end()
+        self.lbl_thumb.setPixmap(px)
+
+    def _request_thumbnail(self):
+        url = self.stream.get("url", "")
+        if not url:
+            return
+        cached = ThumbnailFetcher.cache_path(url)
+        if cached.exists():
+            self._apply_thumbnail(str(cached))
+            return
+        self._fetcher = ThumbnailFetcher(url, self.stream.get("is_local", False))
+        self._fetcher.thumbnail_ready.connect(
+            lambda _url, path: self._apply_thumbnail(path)
+        )
+        self._fetcher.start()
+
+    def _apply_thumbnail(self, path: str):
+        from PyQt6.QtGui import QPixmap
+        px = QPixmap(path)
+        if not px.isNull():
+            px = px.scaled(
+                self.THUMB_W, self.THUMB_H,
+                Qt.AspectRatioMode.KeepAspectRatioByExpanding,
+                Qt.TransformationMode.SmoothTransformation,
+            )
+            # centre-crop
+            if px.width() > self.THUMB_W or px.height() > self.THUMB_H:
+                x = (px.width()  - self.THUMB_W) // 2
+                y = (px.height() - self.THUMB_H) // 2
+                px = px.copy(x, y, self.THUMB_W, self.THUMB_H)
+            self.lbl_thumb.setPixmap(px)
+
+    def _toggle_fav(self):
+        self.stream["favorite"] = not self.stream.get("favorite", False)
+        self.btn_fav.setIcon(create_star_icon(self.stream["favorite"]))
+        self.on_favorite_toggled(self.stream)
+
+    # Keep compat with old attribute name used in populate logic
+    def update_favorite_icon(self):
+        self.btn_fav.setIcon(create_star_icon(self.stream.get("favorite", False)))
+
+
+class StreamGridCard(QWidget):
+    """Single card for the 2-column grid view: thumbnail fills the card, title on hover."""
+
+    clicked = pyqtSignal(object)   # emits stream dict
+
+    CARD_W, CARD_H = 128, 90
+
+    def __init__(self, stream: dict, parent=None):
+        super().__init__(parent)
+        self.stream = stream
+        self._selected = False
+        self._fetcher = None
+        self.setFixedSize(self.CARD_W, self.CARD_H)
+        self.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.setToolTip(stream.get("name", ""))
+
+        self._thumb_px = None
+        self._placeholder_px = self._make_placeholder()
+        self._request_thumbnail()
+
+    def _make_placeholder(self):
+        from PyQt6.QtGui import QPixmap
+        px = QPixmap(self.CARD_W, self.CARD_H)
+        px.fill(QColor("#0c0e13"))
+        p = QPainter(px)
+        p.setRenderHint(QPainter.RenderHint.Antialiasing)
+        p.setPen(Qt.PenStyle.NoPen)
+        p.setBrush(QBrush(QColor("#1e2a35")))
+        cx, cy = self.CARD_W // 2, self.CARD_H // 2
+        tri = QPolygonF([
+            QPointF(cx - 14, cy - 14),
+            QPointF(cx - 14, cy + 14),
+            QPointF(cx + 16, cy),
+        ])
+        p.drawPolygon(tri)
+        p.end()
+        return px
+
+    def _request_thumbnail(self):
+        url = self.stream.get("url", "")
+        if not url:
+            return
+        cached = ThumbnailFetcher.cache_path(url)
+        if cached.exists():
+            self._load_thumb(str(cached))
+            return
+        self._fetcher = ThumbnailFetcher(url, self.stream.get("is_local", False))
+        self._fetcher.thumbnail_ready.connect(
+            lambda _u, p: self._load_thumb(p)
+        )
+        self._fetcher.start()
+
+    def _load_thumb(self, path: str):
+        from PyQt6.QtGui import QPixmap
+        px = QPixmap(path)
+        if not px.isNull():
+            px = px.scaled(
+                self.CARD_W, self.CARD_H,
+                Qt.AspectRatioMode.KeepAspectRatioByExpanding,
+                Qt.TransformationMode.SmoothTransformation,
+            )
+            if px.width() > self.CARD_W or px.height() > self.CARD_H:
+                x = (px.width()  - self.CARD_W) // 2
+                y = (px.height() - self.CARD_H) // 2
+                px = px.copy(x, y, self.CARD_W, self.CARD_H)
+            self._thumb_px = px
+            self.update()
+
+    def set_selected(self, selected: bool):
+        self._selected = selected
+        self.update()
+
+    def mousePressEvent(self, event):
+        if event.button() == Qt.MouseButton.LeftButton:
+            self.clicked.emit(self.stream)
+        super().mousePressEvent(event)
+
+    def contextMenuEvent(self, event):
+        # Notify MainWindow to show the context menu for this card's stream
+        main_win = self.window()
+        if hasattr(main_win, "show_grid_card_context_menu"):
+            main_win.show_grid_card_context_menu(self.stream, event.globalPos())
+        super().contextMenuEvent(event)
+
+
+    def paintEvent(self, event):
+        p = QPainter(self)
+        p.setRenderHint(QPainter.RenderHint.Antialiasing)
+        rect = self.rect().adjusted(1, 1, -1, -1)
+
+        # Draw thumbnail or placeholder
+        src = self._thumb_px if self._thumb_px else self._placeholder_px
+        p.drawPixmap(0, 0, src)
+
+        # Selection border
+        if self._selected:
+            p.setPen(QPen(QColor("#00b4d8"), 2))
+            p.setBrush(Qt.BrushStyle.NoBrush)
+            p.drawRoundedRect(rect, 6, 6)
+        else:
+            p.setPen(QPen(QColor("#1e2029"), 1))
+            p.setBrush(Qt.BrushStyle.NoBrush)
+            p.drawRoundedRect(rect, 6, 6)
+
+        p.end()
+
+
+class StreamGridWidget(QWidget):
+    """2-column grid of StreamGridCards with selection tracking."""
+
+    selection_changed = pyqtSignal(object)   # emits stream dict or None
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self._cards: list[StreamGridCard] = []
+        self._selected_stream = None
+
+        outer = QVBoxLayout(self)
+        outer.setContentsMargins(4, 4, 4, 4)
+        outer.setSpacing(0)
+
+        from PyQt6.QtWidgets import QScrollArea
+        scroll = QScrollArea()
+        scroll.setWidgetResizable(True)
+        scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+        scroll.setStyleSheet("QScrollArea { border: none; background: transparent; }")
+
+        self._container = QWidget()
+        self._container.setStyleSheet("background: transparent;")
+        self._grid = None   # rebuilt on populate
+        scroll.setWidget(self._container)
+        outer.addWidget(scroll)
+
+    def populate(self, streams: list[dict]):
+        # Remove old grid
+        if self._grid:
+            while self._grid.count():
+                item = self._grid.takeAt(0)
+                if item.widget():
+                    item.widget().deleteLater()
+            self._container.layout().deleteLater() if self._container.layout() else None
+
+        from PyQt6.QtWidgets import QGridLayout
+        self._grid = QGridLayout(self._container)
+        self._grid.setSpacing(8)
+        self._grid.setContentsMargins(4, 4, 4, 4)
+
+        self._cards.clear()
+        for idx, stream in enumerate(streams):
+            card = StreamGridCard(stream)
+            card.clicked.connect(self._on_card_clicked)
+            self._grid.addWidget(card, idx // 2, idx % 2)
+            self._cards.append(card)
+
+        # Fill last column if odd count
+        if len(streams) % 2 == 1:
+            self._grid.setColumnStretch(1, 1)
+
+    def _on_card_clicked(self, stream: dict):
+        self._selected_stream = stream
+        for card in self._cards:
+            card.set_selected(card.stream is stream or
+                              card.stream.get("url") == stream.get("url"))
+        self.selection_changed.emit(stream)
+
+    def current_stream(self):
+        return self._selected_stream
+
+    def clear_selection(self):
+        self._selected_stream = None
+        for card in self._cards:
+            card.set_selected(False)
+
+
+# ==============================================================================
+# Legacy StreamItemWidget alias (kept for any remaining call-sites)
+# ==============================================================================
+StreamItemWidget = StreamListItemWidget
+
 
 class MainWindow(QMainWindow):
     """The central dark-themed desktop frontend manager for live stream wallpapers."""
@@ -1685,6 +2297,7 @@ class MainWindow(QMainWindow):
         self.db = DatabaseManager()
         self.proc_manager = ProcessManager()
         self.active_wallpaper_name = None
+        self.active_url = None
         self.force_close_requested = False
         
         # Sleep/wake variables
@@ -1725,37 +2338,39 @@ class MainWindow(QMainWindow):
         sidebar_layout.addWidget(lbl_subtitle)
         sidebar_layout.addSpacing(5)
         
-        # Search Box
+        # Search + Add row
+        search_row = QHBoxLayout()
+        search_row.setSpacing(6)
+
         self.txt_search = QLineEdit()
-        self.txt_search.setPlaceholderText("Search by name or category...")
+        self.txt_search.setPlaceholderText("Search...")
         self.txt_search.textChanged.connect(self.filter_streams)
-        sidebar_layout.addWidget(self.txt_search)
-        
-        # Stream List Widget
+        search_row.addWidget(self.txt_search, stretch=1)
+
+        self.btn_add = QPushButton("+")
+        self.btn_add.setObjectName("btn-add-inline")
+        self.btn_add.setToolTip("Add new wallpaper source")
+        self.btn_add.clicked.connect(self.add_stream)
+        search_row.addWidget(self.btn_add)
+        sidebar_layout.addLayout(search_row)
+
+        # Stream List Widget (placed directly in the sidebar layout)
         self.lst_streams = QListWidget()
         self.lst_streams.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
         self.lst_streams.itemSelectionChanged.connect(self.on_stream_selection_changed)
+        self.lst_streams.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
+        self.lst_streams.customContextMenuRequested.connect(self.show_stream_context_menu)
         sidebar_layout.addWidget(self.lst_streams)
-        
-        # CRUD Buttons Layout
-        crud_layout = QHBoxLayout()
-        crud_layout.setSpacing(8)
-        
-        self.btn_add = QPushButton("Add")
-        self.btn_add.clicked.connect(self.add_stream)
-        
+
+        # Keep references for compatibility
         self.btn_edit = QPushButton("Edit")
-        self.btn_edit.clicked.connect(self.edit_stream)
-        self.btn_edit.setEnabled(False)
-        
+        self.btn_edit.setVisible(False)
         self.btn_delete = QPushButton("Delete")
-        self.btn_delete.clicked.connect(self.delete_stream)
-        self.btn_delete.setEnabled(False)
-        
-        crud_layout.addWidget(self.btn_add)
-        crud_layout.addWidget(self.btn_edit)
-        crud_layout.addWidget(self.btn_delete)
-        sidebar_layout.addLayout(crud_layout)
+        self.btn_delete.setVisible(False)
+        self.btn_view_toggle = QPushButton()
+        self.btn_view_toggle.setVisible(False)
+        self._sidebar_view = 0
+
         
         # ----------------------------------------------------------------------
         # Main Right Panel (QTabWidget)
@@ -1769,131 +2384,156 @@ class MainWindow(QMainWindow):
         main_panel_layout.setContentsMargins(20, 20, 20, 20)
         main_panel_layout.setSpacing(16)
         
-        # Video Preview Section (StackedWidget)
+        # Preview wrapper: preview_stack overlaid with a Download icon button
+        preview_wrapper = QWidget()
+        preview_wrapper.setStyleSheet("background: transparent;")
+        preview_wrapper_layout = QVBoxLayout(preview_wrapper)
+        preview_wrapper_layout.setContentsMargins(0, 0, 0, 0)
+        preview_wrapper_layout.setSpacing(0)
+
         self.preview_stack = QStackedWidget()
-        self.preview_stack.setStyleSheet("background-color: #000000; border-radius: 8px; border: 1px solid #28282f;")
-        
-        # Page 0: Placeholder
+        self.preview_stack.setStyleSheet("""
+            background-color: #0c0e13;
+            border-radius: 10px;
+            border: 1px solid #1e2029;
+        """)
+
+        # Page 0: Styled dark placeholder
         placeholder = QWidget()
+        placeholder.setStyleSheet("background: transparent;")
         placeholder_layout = QVBoxLayout(placeholder)
         placeholder_layout.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        placeholder_layout.setSpacing(10)
-        
-        lbl_placeholder_icon = QLabel("📺")
-        lbl_placeholder_icon.setStyleSheet("font-size: 56px; color: #2e2e36;")
+        placeholder_layout.setSpacing(16)
+
+        from PyQt6.QtGui import QPixmap
+        icon_pixmap = QPixmap(80, 64)
+        icon_pixmap.fill(Qt.GlobalColor.transparent)
+        _p = QPainter(icon_pixmap)
+        _p.setRenderHint(QPainter.RenderHint.Antialiasing)
+        _p.setPen(QPen(QColor("#2a2d38"), 2))
+        _p.setBrush(QBrush(QColor("#13151c")))
+        _p.drawRoundedRect(2, 2, 76, 52, 6, 6)
+        _p.setPen(QPen(QColor("#1e2029"), 1))
+        _p.setBrush(QBrush(QColor("#0c0e13")))
+        _p.drawRoundedRect(8, 8, 64, 38, 3, 3)
+        _p.setPen(QPen(QColor("#2a2d38"), 2))
+        _p.drawLine(40, 54, 40, 60)
+        _p.drawLine(26, 60, 54, 60)
+        _p.setBrush(QBrush(QColor("#1e2a35")))
+        _p.setPen(QPen(QColor("#00b4d8"), 1))
+        triangle_pts = QPolygonF([QPointF(34, 20), QPointF(34, 38), QPointF(50, 29)])
+        _p.drawPolygon(triangle_pts)
+        _p.end()
+
+        lbl_placeholder_icon = QLabel()
+        lbl_placeholder_icon.setPixmap(icon_pixmap)
         lbl_placeholder_icon.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        
-        lbl_placeholder_text = QLabel("Select a stream and click 'Preview Stream'")
-        lbl_placeholder_text.setStyleSheet("color: #7a7a85; font-size: 13px; font-weight: 500;")
+        lbl_placeholder_icon.setStyleSheet("background: transparent;")
+
+        lbl_placeholder_text = QLabel("Select a source to preview")
+        lbl_placeholder_text.setStyleSheet(
+            "color: #2a2d38; font-size: 12px; font-weight: 500; background: transparent;"
+        )
         lbl_placeholder_text.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        
+
         placeholder_layout.addWidget(lbl_placeholder_icon)
         placeholder_layout.addWidget(lbl_placeholder_text)
         self.preview_stack.addWidget(placeholder)
-        
+
         # Page 1: Video container
         self.preview_container = QWidget()
         self.preview_container.setStyleSheet("background-color: #000000;")
         self.preview_stack.addWidget(self.preview_container)
-        
-        main_panel_layout.addWidget(self.preview_stack, stretch=1)
-        
-        # Preview Controls Layout
-        preview_ctrls = QHBoxLayout()
-        preview_ctrls.setSpacing(10)
-        
-        self.btn_prev_play = QPushButton("Preview Stream")
-        self.btn_prev_play.clicked.connect(self.play_selected_preview)
-        self.btn_prev_play.setEnabled(False)
-        
-        self.btn_prev_stop = QPushButton("Stop Preview")
-        self.btn_prev_stop.clicked.connect(self.stop_selected_preview)
-        
-        self.btn_download = QPushButton("Download Copy 📥")
-        self.btn_download.clicked.connect(self.open_download_dialog)
-        self.btn_download.setEnabled(False)
-        
-        self.lbl_prev_status = QLabel("Preview Status: Idle")
-        self.lbl_prev_status.setStyleSheet("color: #7a7a85; font-size: 12px;")
-        
-        preview_ctrls.addWidget(self.btn_prev_play)
-        preview_ctrls.addWidget(self.btn_prev_stop)
-        preview_ctrls.addWidget(self.btn_download)
-        preview_ctrls.addWidget(self.lbl_prev_status)
-        preview_ctrls.addStretch()
-        
-        main_panel_layout.addLayout(preview_ctrls)
-        
-        # Horizontal Divider
-        divider = QFrame()
-        divider.setFrameShape(QFrame.Shape.HLine)
-        divider.setFrameShadow(QFrame.Shadow.Sunken)
-        divider.setStyleSheet("background-color: #28282f; max-height: 1px; border: none;")
-        main_panel_layout.addWidget(divider)
-        
-        # Resolution Settings Layout
-        settings_frame = QFrame()
-        settings_frame.setStyleSheet("""
-            QFrame {
-                background-color: #1a1a1e;
-                border: 1px solid #28282f;
-                border-radius: 8px;
-                padding: 12px;
+
+        preview_wrapper_layout.addWidget(self.preview_stack)
+        main_panel_layout.addWidget(preview_wrapper, stretch=1)
+
+        # Status label (compact, right-aligned under preview)
+        self.lbl_prev_status = QLabel("")
+        self.lbl_prev_status.setStyleSheet("color: #4a5568; font-size: 10px;")
+        self.lbl_prev_status.setAlignment(Qt.AlignmentFlag.AlignRight)
+        main_panel_layout.addWidget(self.lbl_prev_status)
+
+        # Hidden compat references (wired to no-ops below)
+        self.btn_prev_play = QPushButton()
+        self.btn_prev_play.setVisible(False)
+        self.btn_prev_stop = QPushButton()
+        self.btn_prev_stop.setVisible(False)
+
+        # ── Unified footer: [Monitor label + combo] ─────── [●status] [Download] [Apply] [Stop]
+        strip_sep = QFrame()
+        strip_sep.setFrameShape(QFrame.Shape.HLine)
+        strip_sep.setStyleSheet("background-color: #1e2029; max-height: 1px; border: none;")
+        main_panel_layout.addWidget(strip_sep)
+
+        footer_row = QHBoxLayout()
+        footer_row.setSpacing(10)
+        footer_row.setContentsMargins(0, 6, 0, 0)
+
+        # LEFT: Monitor label + dropdown + optional custom input
+        lbl_res = QLabel("Monitor:")
+        lbl_res.setStyleSheet("color: #4a5568; font-size: 11px; font-weight: 600;")
+        footer_row.addWidget(lbl_res)
+
+        from PyQt6.QtWidgets import QListView
+        self.combo_resolution = QComboBox()
+        list_view = QListView()
+        list_view.setStyleSheet("""
+            QListView {
+                background-color: #1a1c23;
+                border: 1px solid #2a2d38;
+                border-radius: 6px;
+                color: #f8f9fa;
+                outline: none;
+            }
+            QListView::item {
+                background-color: #1a1c23;
+                color: #f8f9fa;
+                padding: 6px;
+            }
+            QListView::item:selected {
+                background-color: #00b4d8;
+                color: #ffffff;
             }
         """)
-        settings_layout = QVBoxLayout(settings_frame)
-        settings_layout.setSpacing(10)
-        
-        lbl_settings_header = QLabel("Wallpaper Deployment Options")
-        lbl_settings_header.setStyleSheet("font-weight: bold; color: #e2e2e9; font-size: 13px;")
-        settings_layout.addWidget(lbl_settings_header)
-        
-        res_form = QHBoxLayout()
-        res_form.setSpacing(10)
-        
-        lbl_res = QLabel("Target Resolution:")
-        lbl_res.setStyleSheet("font-weight: 500; color: #a0a0ab;")
-        res_form.addWidget(lbl_res)
-        
-        self.combo_resolution = QComboBox()
-        res_form.addWidget(self.combo_resolution)
-        
+        self.combo_resolution.setView(list_view)
+        self.combo_resolution.setMinimumWidth(240)
+        footer_row.addWidget(self.combo_resolution)
+
         self.txt_custom_res = QLineEdit()
         self.txt_custom_res.setPlaceholderText("e.g. 2560x1440+0+0")
         self.txt_custom_res.setVisible(False)
-        res_form.addWidget(self.txt_custom_res)
-        
-        res_form.addStretch()
-        settings_layout.addLayout(res_form)
-        main_panel_layout.addWidget(settings_frame)
-        
-        # Wallpaper Action Controls (Apply / Stop)
-        action_layout = QHBoxLayout()
-        action_layout.setSpacing(12)
-        
-        self.btn_apply = QPushButton("Apply Wallpaper")
+        footer_row.addWidget(self.txt_custom_res)
+
+        footer_row.addStretch(1)  # push buttons to the right
+
+        # RIGHT: Download + Apply + Stop
+
+        self.btn_download = QPushButton("📥  Download Copy")
+        self.btn_download.setObjectName("btn-download")
+        self.btn_download.setMinimumHeight(38)
+        self.btn_download.setToolTip("Download a local copy of this source")
+        self.btn_download.clicked.connect(self.open_download_dialog)
+        self.btn_download.setEnabled(False)
+        footer_row.addWidget(self.btn_download)
+
+        self.btn_apply = QPushButton("▶  Apply Wallpaper")
         self.btn_apply.setObjectName("btn-apply")
-        self.btn_apply.setMinimumHeight(44)
+        self.btn_apply.setMinimumHeight(38)
         self.btn_apply.clicked.connect(self.apply_wallpaper)
-        
-        self.btn_stop = QPushButton("Stop Wallpaper")
+        footer_row.addWidget(self.btn_apply)
+
+        self.btn_stop = QPushButton("■  Stop")
         self.btn_stop.setObjectName("btn-stop")
-        self.btn_stop.setMinimumHeight(44)
+        self.btn_stop.setMinimumHeight(38)
         self.btn_stop.clicked.connect(self.stop_wallpaper)
-        
-        self.lbl_status = QLabel("Status: Inactive")
-        self.lbl_status.setStyleSheet("color: #a0a0ab; font-size: 13px;")
-        
-        action_layout.addWidget(self.btn_apply)
-        action_layout.addWidget(self.btn_stop)
-        action_layout.addWidget(self.lbl_status)
-        action_layout.addStretch()
-        
-        main_panel_layout.addLayout(action_layout)
+        footer_row.addWidget(self.btn_stop)
+
+        main_panel_layout.addLayout(footer_row)
         
         self.right_tabs.addTab(dashboard_tab, "Wallpaper Dashboard")
-        
-        # --- TAB 2: Help & Compatibility ---
+
+        # --- TAB 2: About & Help ---
         help_tab = QWidget()
         help_layout = QVBoxLayout(help_tab)
         help_layout.setContentsMargins(24, 24, 24, 24)
@@ -1950,7 +2590,7 @@ class MainWindow(QMainWindow):
         lbl_details.setStyleSheet("color: #e2e2e9; line-height: 1.4;")
         help_layout.addWidget(lbl_details)
         
-        self.right_tabs.addTab(help_tab, "Help & Compatibility")
+        self.right_tabs.addTab(help_tab, "About & Help")
         
         # Add sidebars to splitter
         splitter.addWidget(sidebar)
@@ -1960,6 +2600,10 @@ class MainWindow(QMainWindow):
         # Status Bar
         self.status_bar = QStatusBar()
         self.setStatusBar(self.status_bar)
+        
+        self.lbl_status = QLabel("● Inactive")
+        self.lbl_status.setStyleSheet("color: #4a5568; font-size: 11px; margin-right: 12px;")
+        self.status_bar.addPermanentWidget(self.lbl_status)
         self.status_bar.showMessage("Ready")
         
         # Populate GUI contents
@@ -2058,6 +2702,13 @@ class MainWindow(QMainWindow):
     # ----------------------------------------------------------------------
     # Stream Item Management & CRUD
     # ----------------------------------------------------------------------
+    def refresh_stream_item_active_states(self):
+        for i in range(self.lst_streams.count()):
+            item = self.lst_streams.item(i)
+            widget = self.lst_streams.itemWidget(item)
+            if isinstance(widget, StreamListItemWidget):
+                widget.update_active_state(self.active_url)
+
     def populate_stream_list(self):
         self.lst_streams.clear()
         
@@ -2070,13 +2721,13 @@ class MainWindow(QMainWindow):
         for stream in sorted_streams:
             item = QListWidgetItem(self.lst_streams)
             item.setData(Qt.ItemDataRole.UserRole, stream)
-            
-            widget = StreamItemWidget(stream, self.on_favorite_toggled, self.lst_streams)
+            widget = StreamListItemWidget(stream, self.on_favorite_toggled, self.lst_streams)
             item.setSizeHint(widget.sizeHint())
-            
             self.lst_streams.addItem(item)
             self.lst_streams.setItemWidget(item, widget)
-            
+
+        self.refresh_stream_item_active_states()
+
         self.on_stream_selection_changed()
         
     def on_favorite_toggled(self, stream):
@@ -2099,23 +2750,25 @@ class MainWindow(QMainWindow):
                     break
                     
     def on_stream_selection_changed(self):
+        """Fires auto-preview immediately when a list item is selected."""
         current_item = self.lst_streams.currentItem()
         has_selection = current_item is not None
-        
-        self.btn_prev_play.setEnabled(has_selection)
+
         self.btn_edit.setEnabled(has_selection)
         self.btn_delete.setEnabled(has_selection)
-        
+
         if has_selection:
             stream = current_item.data(Qt.ItemDataRole.UserRole)
             can_download = (not stream.get("is_local", False)) and (not stream.get("is_live", False))
             self.btn_download.setEnabled(can_download)
+            # Auto-start preview immediately on selection
+            self.play_selected_preview()
         else:
             self.btn_download.setEnabled(False)
-        
-        # Seamlessly update preview on selection swap if it's already active
-        if has_selection and self.preview_stack.currentIndex() == 1:
-            self.play_selected_preview()
+            self.stop_selected_preview()
+
+    def toggle_sidebar_view(self):
+        pass
             
     def open_download_dialog(self):
         current_item = self.lst_streams.currentItem()
@@ -2195,6 +2848,53 @@ class MainWindow(QMainWindow):
             self.status_bar.showMessage("Deleted stream entry.", 3000)
 
     # ----------------------------------------------------------------------
+    # Context Menu for Stream List
+    # ----------------------------------------------------------------------
+    def show_stream_context_menu(self, pos):
+        item = self.lst_streams.itemAt(pos)
+        if not item:
+            return
+        self.lst_streams.setCurrentItem(item)
+
+        menu = QMenu(self)
+        menu.setStyleSheet("""
+            QMenu {
+                background-color: #1a1c23;
+                border: 1px solid #2a2d38;
+                border-radius: 6px;
+                padding: 4px;
+                color: #f8f9fa;
+                font-size: 12px;
+            }
+            QMenu::item {
+                padding: 7px 18px;
+                border-radius: 4px;
+            }
+            QMenu::item:selected {
+                background-color: #1e2a35;
+                color: #00b4d8;
+            }
+            QMenu::separator {
+                height: 1px;
+                background: #2a2d38;
+                margin: 4px 8px;
+            }
+        """)
+
+        act_edit = QAction("✏  Edit Source", self)
+        act_edit.triggered.connect(self.edit_stream)
+        menu.addAction(act_edit)
+
+        menu.addSeparator()
+
+        act_delete = QAction("🗑  Delete Source", self)
+        act_delete.triggered.connect(self.delete_stream)
+        menu.addAction(act_delete)
+
+        menu.exec(self.lst_streams.mapToGlobal(pos))
+
+
+    # ----------------------------------------------------------------------
     # Screen Geometry & Resolutions
     # ----------------------------------------------------------------------
     def init_resolution_selector(self):
@@ -2248,22 +2948,23 @@ class MainWindow(QMainWindow):
         current_item = self.lst_streams.currentItem()
         if not current_item:
             return
-            
         stream = current_item.data(Qt.ItemDataRole.UserRole)
+        self._play_stream(stream)
+
+    def _play_stream(self, stream: dict):
         url = stream.get("url")
         if not url:
             return
-            
         self.preview_stack.setCurrentIndex(1)
-        self.lbl_prev_status.setText("Preview Status: Buffering/Playing...")
-        
+        self.lbl_prev_status.setText("▶ Buffering…")
         wid = int(self.preview_container.winId())
         self.proc_manager.start_preview(url, wid)
+
         
     def stop_selected_preview(self):
         self.proc_manager.stop_preview()
         self.preview_stack.setCurrentIndex(0)
-        self.lbl_prev_status.setText("Preview Status: Idle")
+        self.lbl_prev_status.setText("Idle")
         
     def apply_wallpaper(self):
         current_item = self.lst_streams.currentItem()
@@ -2281,18 +2982,20 @@ class MainWindow(QMainWindow):
             QMessageBox.warning(self, "Invalid Geometry", "Please specify a valid screen geometry.")
             return
             
-        # Stop preview player before applying background to preserve hardware resources
-        self.stop_selected_preview()
-        
+        # Keep preview running seamlessly by NOT calling stop_selected_preview() here
         self.active_wallpaper_name = stream.get("name", "Live Wallpaper")
+        self.active_url = url
         self.proc_manager.start_wallpaper(url, resolution)
         self.update_ui_state()
+        self.refresh_stream_item_active_states()
         self.status_bar.showMessage("Wallpaper deployed successfully.", 4000)
         
     def stop_wallpaper(self):
         self.proc_manager.stop_wallpaper()
         self.active_wallpaper_name = None
+        self.active_url = None
         self.update_ui_state()
+        self.refresh_stream_item_active_states()
         self.status_bar.showMessage("Wallpaper playback stopped.", 4000)
         
     def toggle_pause_wallpaper(self):
@@ -2313,7 +3016,9 @@ class MainWindow(QMainWindow):
             if self.proc_manager.wallpaper_process.poll() is not None:
                 self.proc_manager.wallpaper_process = None
                 self.active_wallpaper_name = None
+                self.active_url = None
                 self.update_ui_state()
+                self.refresh_stream_item_active_states()
                 self.status_bar.showMessage("Wallpaper background engine stopped unexpectedly.", 5000)
 
     def update_ui_state(self):
@@ -2332,14 +3037,14 @@ class MainWindow(QMainWindow):
         self.btn_stop.setEnabled(is_running)
         
         if is_running:
-            state = "Paused" if is_paused else "Running"
-            self.lbl_status.setText(f"Status: {state} - {self.active_wallpaper_name}")
-            self.lbl_status.setStyleSheet("color: #00b4d8; font-weight: bold; font-size: 13px;")
-            self.tray_icon.setToolTip(f"Wallpaper Motor - {state}")
+            state = "Paused" if is_paused else "Active"
+            self.lbl_status.setText(f"● {state} — {self.active_wallpaper_name}")
+            self.lbl_status.setStyleSheet("color: #00b4d8; font-weight: 600; font-size: 11px; margin-right: 12px;")
+            self.tray_icon.setToolTip(f"Wallpaper Motor — {state}")
         else:
-            self.lbl_status.setText("Status: Inactive")
-            self.lbl_status.setStyleSheet("color: #7a7a85; font-size: 13px;")
-            self.tray_icon.setToolTip("Wallpaper Motor - Idle")
+            self.lbl_status.setText("● Inactive")
+            self.lbl_status.setStyleSheet("color: #4a5568; font-size: 11px; margin-right: 12px;")
+            self.tray_icon.setToolTip("Wallpaper Motor — Idle")
 
     @pyqtSlot(bool)
     def handle_prepare_for_sleep(self, entering):
@@ -2362,7 +3067,7 @@ class MainWindow(QMainWindow):
             # System is waking up from sleep
             if self.restart_wallpaper_on_wake and self.last_wallpaper_url:
                 self.lbl_status.setText("Status: Reconnecting stream after system wake...")
-                self.lbl_status.setStyleSheet("color: #ffb703; font-weight: bold; font-size: 13px;")
+                self.lbl_status.setStyleSheet("color: #ffb703; font-weight: bold; font-size: 11px; margin-right: 12px;")
                 
                 # Give network cards 10 seconds to fully reconnect to the network
                 QTimer.singleShot(10000, self.auto_resume_after_wake)
@@ -2388,141 +3093,224 @@ class MainWindow(QMainWindow):
             self.last_wallpaper_resolution = None
 
     # ==============================================================================
-    # Stylesheet (Modern Sterile Dark Theme)
+    # Stylesheet (Modern Dark Slate Theme — 60/30/10 Palette)
     # ==============================================================================
     def get_qss(self):
         return """
-        QMainWindow {
-            background-color: #121214;
+        /* ── Base ── */
+        QMainWindow, QWidget {
+            background-color: #121318;
+            font-family: 'Segoe UI', 'Inter', sans-serif;
         }
 
+        /* ── Sidebar ── */
         QFrame#sidebar {
-            background-color: #1a1a1e;
-            border-right: 1px solid #28282f;
+            background-color: #1a1c23;
+            border-right: 1px solid #22242d;
         }
 
-        QFrame#main-panel {
-            background-color: #121214;
-        }
-
+        /* ── Typography ── */
         QLabel {
             color: #e2e2e9;
             font-size: 13px;
+            background: transparent;
         }
 
         QLabel#lbl-title {
-            font-size: 18px;
+            font-size: 15px;
             font-weight: 800;
             color: #00b4d8;
-            letter-spacing: 1px;
+            letter-spacing: 2px;
         }
 
         QLabel#lbl-subtitle {
-            font-size: 11px;
-            font-weight: 600;
-            color: #5a5a65;
+            font-size: 10px;
+            font-weight: 500;
+            color: #4a5568;
         }
 
+        /* ── Inputs ── */
         QLineEdit {
-            background-color: #25252b;
-            border: 1px solid #2d2d34;
+            background-color: #1e2029;
+            border: 1px solid #2a2d38;
             border-radius: 6px;
-            padding: 8px 12px;
-            color: #e2e2e9;
+            padding: 7px 11px;
+            color: #f8f9fa;
             font-size: 13px;
+            selection-background-color: #00b4d8;
         }
 
         QLineEdit:focus {
-            border: 1px solid #00b4d8;
-            background-color: #2a2a32;
+            border-color: #00b4d8;
+            background-color: #20232e;
         }
 
+        QLineEdit:disabled {
+            background-color: #161820;
+            color: #4a5568;
+        }
+
+        /* ── Stream List ── */
         QListWidget {
-            background-color: #121214;
-            border: 1px solid #28282f;
-            border-radius: 8px;
-            padding: 4px;
+            background-color: transparent;
+            border: none;
+            padding: 2px 0px;
+            outline: none;
         }
 
         QListWidget::item {
-            background-color: #1a1a1e;
-            border: 1px solid #28282f;
+            background-color: transparent;
+            border: none;
             border-radius: 6px;
-            margin-bottom: 5px;
+            margin-bottom: 2px;
+            padding: 0px;
         }
 
         QListWidget::item:hover {
-            background-color: #23232a;
-            border-color: #34343d;
+            background-color: #1f2230;
         }
 
         QListWidget::item:selected {
-            background-color: #282830;
-            border-color: #00b4d8;
+            background-color: #1e2a35;
+            border-left: 3px solid #00b4d8;
         }
 
+        /* ── Buttons (default ghost state) ── */
         QPushButton {
-            background-color: #25252b;
-            border: 1px solid #2d2d34;
+            background-color: #1e2029;
+            border: 1px solid #2a2d38;
             border-radius: 6px;
-            padding: 8px 16px;
-            color: #e2e2e9;
-            font-weight: bold;
+            padding: 7px 14px;
+            color: #94a3b8;
+            font-weight: 600;
             font-size: 12px;
         }
 
         QPushButton:hover {
-            background-color: #2d2d34;
-            border-color: #3e3e48;
+            background-color: #252836;
+            border-color: #3a3f52;
+            color: #f8f9fa;
         }
 
         QPushButton:pressed {
-            background-color: #1d1d22;
+            background-color: #171920;
         }
 
         QPushButton:disabled {
-            background-color: #16161a;
-            color: #5a5a62;
-            border-color: #202024;
+            background-color: #141619;
+            color: #2e3344;
+            border-color: #1c1e27;
         }
 
+        /* ── Apply Wallpaper (primary CTA) ── */
         QPushButton#btn-apply {
             background-color: #00b4d8;
-            border: 1px solid #0096b4;
+            border: 1px solid #0096b8;
             color: #ffffff;
             font-size: 13px;
+            font-weight: 700;
+            padding: 9px 22px;
         }
 
         QPushButton#btn-apply:hover {
-            background-color: #00c4ec;
+            background-color: #00caee;
+            border-color: #00b4d8;
         }
 
         QPushButton#btn-apply:pressed {
-            background-color: #008eb0;
+            background-color: #008aaa;
         }
 
+        QPushButton#btn-apply:disabled {
+            background-color: #0d3a47;
+            border-color: #0a2e38;
+            color: #2a6070;
+        }
+
+        /* ── Stop Wallpaper (desaturated destructive state) ── */
         QPushButton#btn-stop {
-            background-color: #d90429;
-            border: 1px solid #b3001e;
-            color: #ffffff;
+            background-color: #1e2029;
+            border: 1px solid #4a2530;
+            color: #e63946;
             font-size: 13px;
+            font-weight: 700;
+            padding: 9px 22px;
         }
 
         QPushButton#btn-stop:hover {
-            background-color: #ef233c;
+            background-color: #e63946;
+            border-color: #c0303b;
+            color: #ffffff;
         }
 
         QPushButton#btn-stop:pressed {
-            background-color: #b3001e;
+            background-color: #b8202c;
         }
 
-        QComboBox {
-            background-color: #25252b;
-            border: 1px solid #2d2d34;
+        QPushButton#btn-stop:disabled {
+            background-color: #141619;
+            border-color: #1c1e27;
+            color: #3a2020;
+        }
+
+        /* ── Add button (sidebar inline) ── */
+        QPushButton#btn-add-inline {
+            background-color: #0d3a47;
+            border: 1px solid #00b4d8;
             border-radius: 6px;
-            padding: 8px 12px;
-            color: #e2e2e9;
-            min-width: 220px;
+            color: #00b4d8;
+            font-size: 16px;
+            font-weight: 700;
+            padding: 5px 10px;
+            min-width: 32px;
+            max-width: 36px;
+        }
+
+        QPushButton#btn-add-inline:hover {
+            background-color: #00b4d8;
+            color: #ffffff;
+        }
+
+        /* ── Download Copy (secondary CTA in footer) ── */
+        QPushButton#btn-download {
+            background-color: #1e2029;
+            border: 1px solid #2a2d38;
+            color: #00b4d8;
+            font-size: 13px;
+            font-weight: 700;
+            padding: 9px 22px;
+            border-radius: 6px;
+        }
+
+        QPushButton#btn-download:hover {
+            background-color: #00b4d8;
+            border-color: #00caee;
+            color: #ffffff;
+        }
+
+        QPushButton#btn-download:pressed {
+            background-color: #008aaa;
+            border-color: #00b4d8;
+            color: #ffffff;
+        }
+
+        QPushButton#btn-download:disabled {
+            background-color: #141619;
+            border-color: #1c1e27;
+            color: #2e3344;
+        }
+
+
+
+        /* ── ComboBox ── */
+        QComboBox {
+            background-color: #1e2029;
+            border: 1px solid #2a2d38;
+            border-radius: 6px;
+            padding: 7px 11px;
+            color: #f8f9fa;
+            min-width: 200px;
+            font-size: 13px;
         }
 
         QComboBox:focus {
@@ -2533,55 +3321,101 @@ class MainWindow(QMainWindow):
             border: none;
             subcontrol-origin: padding;
             subcontrol-position: top right;
-            width: 25px;
+            width: 24px;
         }
 
         QComboBox::down-arrow {
             image: none;
             border-left: 5px solid transparent;
             border-right: 5px solid transparent;
-            border-top: 5px solid #e2e2e9;
-            margin-right: 10px;
+            border-top: 5px solid #94a3b8;
+            margin-right: 8px;
         }
 
+        QComboBox QAbstractItemView {
+            background-color: #1a1c23;
+            border: 1px solid #2a2d38;
+            border-radius: 6px;
+            color: #f8f9fa;
+            selection-background-color: #00b4d8;
+            selection-color: #ffffff;
+            outline: none;
+        }
+
+        QComboBox QAbstractItemView::item {
+            background-color: #1a1c23;
+            color: #f8f9fa;
+            padding: 6px;
+        }
+
+        QComboBox QAbstractItemView::item:selected {
+            background-color: #00b4d8;
+            color: #ffffff;
+        }
+
+
+        /* ── Splitter ── */
         QSplitter::handle {
-            background-color: #28282f;
+            background-color: #22242d;
+            width: 1px;
         }
 
+        /* ── Status Bar ── */
         QStatusBar {
-            background-color: #121214;
-            border-top: 1px solid #28282f;
-            color: #7a7a85;
+            background-color: #0e1015;
+            border-top: 1px solid #1e2029;
+            color: #4a5568;
             font-size: 11px;
+            padding: 2px 8px;
         }
 
+        /* ── Tab Bar ── */
         QTabWidget::pane {
-            border: 1px solid #28282f;
-            background-color: #121214;
-            border-top: none;
+            border: none;
+            border-top: 1px solid #22242d;
+            background-color: #121318;
         }
 
         QTabBar::tab {
-            background-color: #1a1a1e;
-            color: #8a8a98;
-            border: 1px solid #28282f;
-            border-bottom: none;
-            border-top-left-radius: 6px;
-            border-top-right-radius: 6px;
-            padding: 8px 16px;
-            font-weight: bold;
+            background-color: transparent;
+            color: #4a5568;
+            border: none;
+            border-bottom: 2px solid transparent;
+            padding: 10px 18px;
+            font-weight: 600;
             font-size: 12px;
+            margin-right: 4px;
         }
 
         QTabBar::tab:selected {
-            background-color: #121214;
             color: #00b4d8;
             border-bottom: 2px solid #00b4d8;
         }
 
-        QTabBar::tab:hover {
-            background-color: #23232a;
-            color: #e2e2e9;
+        QTabBar::tab:hover:!selected {
+            color: #94a3b8;
+            border-bottom: 2px solid #2a2d38;
+        }
+
+        /* ── ScrollBar ── */
+        QScrollBar:vertical {
+            background: #121318;
+            width: 6px;
+            border-radius: 3px;
+        }
+        QScrollBar::handle:vertical {
+            background: #2a2d38;
+            border-radius: 3px;
+            min-height: 24px;
+        }
+        QScrollBar::handle:vertical:hover {
+            background: #3a3f52;
+        }
+        QScrollBar::add-line:vertical, QScrollBar::sub-line:vertical {
+            height: 0px;
+        }
+        QScrollBar::add-page:vertical, QScrollBar::sub-page:vertical {
+            background: none;
         }
         """
 
@@ -2603,6 +3437,32 @@ def register_exit_handler(proc_manager):
 if __name__ == "__main__":
     # Handle X11 integration and PyQt initialization
     app = QApplication(sys.argv)
+    app.setStyle("Fusion")
+
+    # Set dark theme QPalette to ensure that native popups/comboboxes don't have white background/borders
+    from PyQt6.QtGui import QPalette, QColor
+    from PyQt6.QtCore import Qt
+    
+    palette = QPalette()
+    dark_bg = QColor("#121318")
+    dark_surface = QColor("#1a1c23")
+    text_color = QColor("#f8f9fa")
+    accent_color = QColor("#00b4d8")
+    
+    palette.setColor(QPalette.ColorRole.Window, dark_bg)
+    palette.setColor(QPalette.ColorRole.WindowText, text_color)
+    palette.setColor(QPalette.ColorRole.Base, dark_surface)
+    palette.setColor(QPalette.ColorRole.AlternateBase, dark_bg)
+    palette.setColor(QPalette.ColorRole.ToolTipBase, dark_surface)
+    palette.setColor(QPalette.ColorRole.ToolTipText, text_color)
+    palette.setColor(QPalette.ColorRole.Text, text_color)
+    palette.setColor(QPalette.ColorRole.Button, dark_surface)
+    palette.setColor(QPalette.ColorRole.ButtonText, text_color)
+    palette.setColor(QPalette.ColorRole.BrightText, Qt.GlobalColor.red)
+    palette.setColor(QPalette.ColorRole.Highlight, accent_color)
+    palette.setColor(QPalette.ColorRole.HighlightedText, Qt.GlobalColor.white)
+    
+    app.setPalette(palette)
     app.setQuitOnLastWindowClosed(False)
 
     # Wayland Safety Detector
