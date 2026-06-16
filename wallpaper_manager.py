@@ -2017,22 +2017,30 @@ class StreamListItemWidget(QWidget):
         cat_text = self.stream.get("category", "General").upper()
         self.lbl_cat = QLabel()
         
-        # Check if the source is a live stream (either explicitly set, or inferred from remote stream signatures)
+        is_local = self.stream.get("is_local", False)
         url_lower = self.stream.get("url", "").lower()
         is_live = (self.stream.get("is_live", False) or 
-                   (not self.stream.get("is_local", False) and 
-                    any(k in url_lower for k in ["m3u8", "rtmp", "rtsp", "/live", "twitch.tv", "live/"])))
+                   (not is_local and any(k in url_lower for k in ["m3u8", "rtmp", "rtsp", "/live", "twitch.tv", "live/"])))
                     
-        if is_live:
+        if is_local:
+            # Local video file loop
+            self.lbl_cat.setText(f"{cat_text}  •  VIDEO")
+            self.lbl_cat.setStyleSheet(
+                "font-size: 9px; font-weight: 700; color: #4a5568;"
+                "background: transparent; padding: 0;"
+            )
+        elif is_live:
+            # Active broadcast stream
             self.lbl_cat.setText(f"{cat_text}  •  LIVE")
             self.lbl_cat.setStyleSheet(
                 "font-size: 9px; font-weight: 800; color: #ef233c;"
                 "background: transparent; padding: 0;"
             )
         else:
-            self.lbl_cat.setText(f"{cat_text}  •  VIDEO")
+            # Online stream URL (YouTube / VOD)
+            self.lbl_cat.setText(f"{cat_text}  •  STREAM")
             self.lbl_cat.setStyleSheet(
-                "font-size: 9px; font-weight: 700; color: #4a5568;"
+                "font-size: 9px; font-weight: 700; color: #00b4d8;"
                 "background: transparent; padding: 0;"
             )
         self.lbl_cat.setSizePolicy(QSizePolicy.Policy.Fixed, QSizePolicy.Policy.Fixed)
