@@ -2696,6 +2696,23 @@ class MainWindow(QMainWindow):
                 self.tray_notified = True
             event.ignore()
 
+    def showEvent(self, event):
+        """Forces the custom list item widgets to stretch to the actual viewport width on first show."""
+        super().showEvent(event)
+        QTimer.singleShot(0, self.force_list_layout_update)
+        QTimer.singleShot(50, self.force_list_layout_update)
+        
+    def force_list_layout_update(self):
+        """Explicitly resizes all custom list item widgets to match the visible viewport width of the QListWidget."""
+        w = self.lst_streams.viewport().width()
+        if w > 0:
+            for i in range(self.lst_streams.count()):
+                item = self.lst_streams.item(i)
+                widget = self.lst_streams.itemWidget(item)
+                if widget:
+                    widget.resize(w, widget.height())
+            self.lst_streams.updateGeometries()
+
     # ----------------------------------------------------------------------
     # Stream Item Management & CRUD
     # ----------------------------------------------------------------------
@@ -2726,6 +2743,7 @@ class MainWindow(QMainWindow):
         self.refresh_stream_item_active_states()
 
         self.on_stream_selection_changed()
+        QTimer.singleShot(0, self.force_list_layout_update)
         
     def on_favorite_toggled(self, stream):
         self.db.save_streams()
