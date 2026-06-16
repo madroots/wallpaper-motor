@@ -2021,10 +2021,10 @@ class StreamListItemWidget(QWidget):
         
         if is_local:
             type_label = "VIDEO"
-            type_color = "#718096"  # Soft slate/gray
+            type_color = "#b8984d"  # Soft amber-yellow
         else:
             type_label = "STREAM"
-            type_color = "#0096b4"  # Softer, less bright cyan
+            type_color = "#0a7e93"  # Softer, deeper cyan
             
         category_html = f"<span style='color: #4a5568; font-weight: 700;'>{cat_text}</span>  <span style='color: #2d3748;'>•</span>  <span style='color: {type_color}; font-weight: 700;'>{type_label}</span>"
         self.lbl_cat.setText(category_html)
